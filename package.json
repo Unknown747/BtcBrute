@@ -8,6 +8,8 @@
     "start": "node index.js"
   },
   "dependencies": {
+    "bip32": "^5.0.1",
+    "bip39": "^3.1.0",
     "bitcoinjs-lib": "^7.0.1",
     "ecpair": "^3.0.1",
     "tiny-secp256k1": "^2.2.4",

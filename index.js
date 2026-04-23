@@ -19,6 +19,8 @@ import { fileURLToPath } from "node:url";
 import * as bitcoin from "bitcoinjs-lib";
 import * as ecc from "tiny-secp256k1";
 import { ECPairFactory } from "ecpair";
+import * as bip39 from "bip39";
+import { BIP32Factory } from "bip32";
 // Note: Node 20's built-in fetch already uses a keep-alive pool by default.
 // We previously installed a custom undici Agent here for longer keep-alive
 // timeouts, but it caused fetch to hang inside worker threads on this Node
@@ -26,8 +28,53 @@ import { ECPairFactory } from "ecpair";
 
 bitcoin.initEccLib(ecc);
 const ECPair = ECPairFactory(ecc);
+const bip32 = BIP32Factory(ecc);
 const NETWORK = bitcoin.networks.bitcoin;
 const SELF = fileURLToPath(import.meta.url);
+
+// BIP path -> (pubkey -> address) mapping. BIP44 = legacy P2PKH,
+// BIP49 = nested SegWit (P2SH-P2WPKH), BIP84 = native SegWit (P2WPKH).
+const BIP_PATHS = {
+  bip44: { coin: "44'/0'/0'/0", type: "bip44-p2pkh", toAddress: (pub) =>
+    bitcoin.payments.p2pkh({ pubkey: pub, network: NETWORK }).address },
+  bip49: { coin: "49'/0'/0'/0", type: "bip49-p2sh-p2wpkh", toAddress: (pub) =>
+    bitcoin.payments.p2sh({
+      redeem: bitcoin.payments.p2wpkh({ pubkey: pub, network: NETWORK }),
+      network: NETWORK,
+    }).address },
+  bip84: { coin: "84'/0'/0'/0", type: "bip84-p2wpkh", toAddress: (pub) =>
+    bitcoin.payments.p2wpkh({ pubkey: pub, network: NETWORK }).address },
+};
+
+function makeMnemonicSet(opts) {
+  // Returns { mnemonic, derivations: [{type, path, address, wif}, ...] }.
+  // Generates one fresh mnemonic and walks the requested BIP paths +
+  // address indices, producing N×paths.length addresses to check.
+  const strength = opts.strength === 256 ? 256 : 128; // 128=12 words, 256=24
+  const mnemonic = bip39.generateMnemonic(strength);
+  const seed = bip39.mnemonicToSeedSync(mnemonic);
+  const root = bip32.fromSeed(seed, NETWORK);
+  const paths = Array.isArray(opts.paths) && opts.paths.length > 0
+    ? opts.paths.filter((p) => BIP_PATHS[p])
+    : ["bip44", "bip49", "bip84"];
+  const count = Math.max(1, opts.addressesPerPath ?? 5);
+  const derivations = [];
+  for (const p of paths) {
+    const def = BIP_PATHS[p];
+    for (let i = 0; i < count; i++) {
+      const path = `m/${def.coin}/${i}`;
+      const node = root.derivePath(path);
+      const wif = ECPair.fromPrivateKey(node.privateKey, { network: NETWORK, compressed: true }).toWIF();
+      derivations.push({
+        type: def.type,
+        path,
+        address: def.toAddress(node.publicKey),
+        wif,
+      });
+    }
+  }
+  return { mnemonic, derivations };
+}
 
 function loadConfig() {
   const raw = readFileSync(new URL("./config.json", import.meta.url), "utf8");
@@ -268,6 +315,9 @@ async function runWorker() {
   const cooldownUntil = {};
   const batchKeypairs = Math.max(1, cfg.batchKeypairs ?? 1);
   const batchChunkSize = Math.max(1, cfg.batchChunkSize ?? 50);
+  const bip39Cfg = cfg.bip39 ?? {};
+  const bip39Enabled = enabled.bip39 === true;
+  const bip39PerBatch = Math.max(0, bip39Cfg.mnemonicsPerBatch ?? 1);
 
   // Tiny LRU cache: address -> balance. Catches the (vanishingly rare) case
   // of duplicate addresses without an extra HTTP round-trip.
@@ -290,8 +340,11 @@ async function runWorker() {
       while (paused) await sleep(1000);
     }
     try {
-      // Generate a batch of keypairs and build the combined task list so we
-      // can resolve all of their balances in one (or few) HTTP request(s).
+      // Generate a batch of items and build the combined task list so we can
+      // resolve all of their balances in one (or few) HTTP request(s).
+      // Each item is either a random keypair (kind="kp") or an HD wallet
+      // generated from a fresh BIP39 mnemonic (kind="mn") with multiple
+      // derived addresses across BIP44/49/84 paths.
       const items = [];
       const allAddrs = [];
       for (let i = 0; i < batchKeypairs; i++) {
@@ -303,8 +356,15 @@ async function runWorker() {
         if (enabled.segwit)       tasks.push(["segwit",       kp.segwitAddress]);
         if (enabled.nestedSegwit) tasks.push(["nestedSegwit", kp.nestedSegwitAddress]);
         if (multi)                tasks.push(["multi",        multi.address]);
-        items.push({ kp, multi, tasks });
+        items.push({ kind: "kp", kp, multi, tasks });
         for (const [, a] of tasks) allAddrs.push(a);
+      }
+      if (bip39Enabled && bip39PerBatch > 0) {
+        for (let i = 0; i < bip39PerBatch; i++) {
+          const set = makeMnemonicSet(bip39Cfg);
+          items.push({ kind: "mn", mnemonic: set.mnemonic, derivations: set.derivations });
+          for (const d of set.derivations) allAddrs.push(d.address);
+        }
       }
 
       const cachedHits = {};
@@ -329,12 +389,25 @@ async function runWorker() {
         balMap = { ...balMap, ...fetched };
       }
 
-      for (const { kp, multi, tasks } of items) {
-        const balances = {
-          uncompressed: 0, compressed: 0, segwit: 0, nestedSegwit: 0, multi: 0,
-        };
-        tasks.forEach(([key, addr]) => { balances[key] = Number(balMap[addr] ?? 0); });
-        parentPort.postMessage({ type: "result", workerId: id, kp, multi, balances });
+      for (const item of items) {
+        if (item.kind === "kp") {
+          const balances = {
+            uncompressed: 0, compressed: 0, segwit: 0, nestedSegwit: 0, multi: 0,
+          };
+          item.tasks.forEach(([key, addr]) => { balances[key] = Number(balMap[addr] ?? 0); });
+          parentPort.postMessage({
+            type: "result", workerId: id, kp: item.kp, multi: item.multi, balances,
+          });
+        } else {
+          // mnemonic item: attach balance to each derivation
+          const derivations = item.derivations.map((d) => ({
+            ...d, balance: Number(balMap[d.address] ?? 0),
+          }));
+          parentPort.postMessage({
+            type: "mnemonicResult", workerId: id,
+            mnemonic: item.mnemonic, derivations,
+          });
+        }
       }
       flushEp();
     } catch (err) {
@@ -399,6 +472,39 @@ function printRow(count, workerId, kp, multi, balances, enabled) {
 
 function appendHitLine(file, obj) {
   appendFileSync(file, JSON.stringify(obj) + "\n");
+}
+
+function printMnemonicRow(count, workerId, mnemonic, derivations) {
+  // Compact mnemonic banner: show first 3 + last 2 words to save console
+  // real estate while still letting you eyeball uniqueness in logs.
+  const words = mnemonic.split(" ");
+  const preview = words.length <= 6
+    ? words.join(" ")
+    : `${words.slice(0, 3).join(" ")} … ${words.slice(-2).join(" ")} (${words.length}w)`;
+  const header = `${C.gray}┌─ ${C.bold}#${padLeft(count, 6)}${C.reset}${C.gray} ─ worker ${workerId} ─ ${C.cyan}mnemonic${C.gray} ${preview} ${"─".repeat(Math.max(0, 30 - preview.length))}${C.reset}`;
+  console.log(header);
+  for (let i = 0; i < derivations.length; i++) {
+    const d = derivations[i];
+    const branch = i === derivations.length - 1 ? "└" : "├";
+    const balColor = d.balance > 0 ? C.green + C.bold : C.dim;
+    console.log(
+      `${C.gray}${branch}─${C.reset} ${C.cyan}${pad(d.type, 18)}${C.reset} ${pad(d.address, 44)} ${balColor}${padLeft(d.balance, 10)}${C.reset} sat`,
+    );
+  }
+}
+
+function handleMnemonicHit(cfg, mnemonic, derivations) {
+  const ts = new Date().toISOString();
+  const hits = derivations.filter((d) => d.balance > 0);
+  if (hits.length === 0) return false;
+  for (const h of hits) {
+    appendHitLine(cfg.outputFile, {
+      ts, source: "bip39", type: h.type, address: h.address, balance: h.balance,
+      derivationPath: h.path, wif: h.wif, mnemonic,
+    });
+  }
+  console.log("\n!!! You have just rung the bell of BTC Lottery !!! (BIP39)");
+  return true;
 }
 
 function handleHit(cfg, kp, multi, balances) {
@@ -489,7 +595,7 @@ function applyEnvOverrides(cfg) {
 }
 
 function normalizeAddressTypes(cfg) {
-  const def = { uncompressed: true, compressed: true, segwit: true, nestedSegwit: true, multisig: true };
+  const def = { uncompressed: true, compressed: true, segwit: true, nestedSegwit: true, multisig: true, bip39: false };
   if (cfg.addressTypes && typeof cfg.addressTypes === "object") {
     return { ...def, ...cfg.addressTypes };
   }
@@ -506,6 +612,12 @@ async function runMain() {
   cfg.batchKeypairs = Math.max(1, cfg.batchKeypairs ?? 1);
   cfg.batchChunkSize = Math.max(1, cfg.batchChunkSize ?? 50);
   cfg.rateLimitCooldownMs = cfg.rateLimitCooldownMs ?? 60000;
+  cfg.bip39 = {
+    strength: cfg.bip39?.strength ?? 128,
+    paths: cfg.bip39?.paths ?? ["bip44", "bip49", "bip84"],
+    addressesPerPath: Math.max(1, cfg.bip39?.addressesPerPath ?? 5),
+    mnemonicsPerBatch: Math.max(0, cfg.bip39?.mnemonicsPerBatch ?? 1),
+  };
 
   // Auto-throttle config (resolved here so it can be shown in the banner).
   const autoTune = cfg.autoTune ?? {};
@@ -551,6 +663,9 @@ async function runMain() {
   console.log(row("Rate-limit cool", `${cfg.rateLimitCooldownMs / 1000}s on HTTP 429`));
   console.log(row("Auto-throttle",   tuneEnabled
     ? `${C.green}ON${C.reset} delay ${cfg.perAddressDelayMs}ms (range ${minDelay}–${maxDelay}ms)`
+    : `${C.dim}off${C.reset}`));
+  console.log(row("BIP39 mnemonic",  cfg.addressTypes.bip39
+    ? `${C.green}ON${C.reset} ${cfg.bip39.mnemonicsPerBatch}/batch × ${cfg.bip39.paths.length} paths × ${cfg.bip39.addressesPerPath} addr (${cfg.bip39.strength === 256 ? 24 : 12} words)`
     : `${C.dim}off${C.reset}`));
   console.log(row("Run",             `#${persisted.runs}`));
   console.log(row("Cumulative",
@@ -760,6 +875,30 @@ async function runMain() {
         stats.errors += 1;
         recordError(msg.message);
         console.log(`\t[worker ${msg.workerId}] error: ${msg.message}`);
+        return;
+      }
+      if (msg.type === "mnemonicResult") {
+        stats.count += 1;
+        stats.mnemonicCount = (stats.mnemonicCount ?? 0) + 1;
+        const count = stats.count;
+        const hit = handleMnemonicHit(cfg, msg.mnemonic, msg.derivations);
+        if (hit) {
+          stats.hits += 1;
+          saveState(stateFile, snapshotPersisted());
+          if (cfg.pauseOnHit) {
+            await stopAll("HIT FOUND");
+            return;
+          }
+        }
+        if (!hit && cfg.verbose) {
+          printMnemonicRow(count, msg.workerId, msg.mnemonic, msg.derivations);
+        }
+        if (cfg.roundPauseMs > 0 && count % pauseEvery === 0) {
+          const elapsed = ((Date.now() - startedAt) / 1000).toFixed(1);
+          console.log(`\n\t${count} addresses checked in ${elapsed}s — pausing ${cfg.roundPauseMs / 1000}s ...\n`);
+          await sleep(cfg.roundPauseMs);
+          console.log("\t Resuming ...\n");
+        }
         return;
       }
       stats.count += 1;

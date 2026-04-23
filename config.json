@@ -31,7 +31,14 @@
     "compressed": true,
     "segwit": true,
     "nestedSegwit": true,
-    "multisig": false
+    "multisig": false,
+    "bip39": true
+  },
+  "bip39": {
+    "strength": 128,
+    "paths": ["bip44", "bip49", "bip84"],
+    "addressesPerPath": 5,
+    "mnemonicsPerBatch": 1
   },
   "outputFile": "Lottery_BTC.jsonl",
   "backupIntervalMs": 3600000,
