@@ -95,10 +95,12 @@ const ENDPOINT_PARSERS = {
     );
   },
 };
+ENDPOINT_PARSERS.mempool = ENDPOINT_PARSERS.blockstream;
 
 function buildEndpointUrl(endpoint, address) {
   if (endpoint.type === "blockchain") return `${endpoint.url}${address}`;
   if (endpoint.type === "blockstream") return `${endpoint.url}${address}`;
+  if (endpoint.type === "mempool") return `${endpoint.url}${address}`;
   throw new Error(`Unknown endpoint type: ${endpoint.type}`);
 }
 

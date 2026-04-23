@@ -7,7 +7,8 @@
   "errorBackoffMs": 15000,
   "endpoints": [
     { "type": "blockchain", "url": "https://blockchain.info/balance?active=" },
-    { "type": "blockstream", "url": "https://blockstream.info/api/address/" }
+    { "type": "blockstream", "url": "https://blockstream.info/api/address/" },
+    { "type": "mempool", "url": "https://mempool.space/api/address/" }
   ],
   "addressTypes": {
     "uncompressed": false,
