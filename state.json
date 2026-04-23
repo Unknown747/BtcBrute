@@ -1,7 +1,21 @@
 {
-  "totalCount": 929,
+  "totalCount": 962,
   "totalHits": 0,
-  "totalErrors": 89,
-  "totalUptimeMs": 1705005,
-  "runs": 11
+  "totalErrors": 118,
+  "totalUptimeMs": 2562140,
+  "runs": 14,
+  "endpointStats": {
+    "blockchain": {
+      "ok": 0,
+      "err": 31
+    },
+    "blockstream": {
+      "ok": 0,
+      "err": 31
+    },
+    "mempool": {
+      "ok": 14,
+      "err": 17
+    }
+  }
 }

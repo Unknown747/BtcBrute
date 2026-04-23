@@ -19,6 +19,10 @@ import { fileURLToPath } from "node:url";
 import * as bitcoin from "bitcoinjs-lib";
 import * as ecc from "tiny-secp256k1";
 import { ECPairFactory } from "ecpair";
+// Note: Node 20's built-in fetch already uses a keep-alive pool by default.
+// We previously installed a custom undici Agent here for longer keep-alive
+// timeouts, but it caused fetch to hang inside worker threads on this Node
+// version. Default dispatcher is fine for our request rate.
 
 bitcoin.initEccLib(ecc);
 const ECPair = ECPairFactory(ecc);
@@ -148,6 +152,7 @@ async function fetchOnce(url, timeoutMs) {
 async function getBalances(addresses, endpoints, strategy, epStats, opts) {
   const timeoutMs = opts.requestTimeoutMs;
   const errorBackoffMs = opts.errorBackoffMs;
+  const rateLimitBackoffMs = opts.rateLimitBackoffMs ?? 5000;
   let lastErr;
 
   for (const endpoint of orderEndpoints(endpoints, strategy)) {
@@ -168,7 +173,7 @@ async function getBalances(addresses, endpoints, strategy, epStats, opts) {
           const transient =
             !err.status || err.status >= 500 || err.status === 429 || err.name === "TimeoutError" || err.name === "AbortError";
           if (!transient) throw err;
-          const wait = err.status === 429 ? errorBackoffMs : Math.min(errorBackoffMs, 3000);
+          const wait = err.status === 429 ? rateLimitBackoffMs : Math.min(errorBackoffMs, 3000);
           await sleep(wait);
           res = await fetchOnce(url, timeoutMs);
         }
@@ -212,6 +217,23 @@ async function runWorker() {
   const opts = {
     requestTimeoutMs: cfg.requestTimeoutMs ?? 10000,
     errorBackoffMs: cfg.errorBackoffMs ?? 15000,
+    rateLimitBackoffMs: cfg.rateLimitBackoffMs ?? 5000,
+  };
+
+  // Tiny LRU cache: address -> balance. Catches the (vanishingly rare) case
+  // of duplicate addresses without an extra HTTP round-trip.
+  const CACHE_MAX = 1000;
+  const cache = new Map();
+  const cacheGet = (k) => {
+    if (!cache.has(k)) return undefined;
+    const v = cache.get(k);
+    cache.delete(k); cache.set(k, v);
+    return v;
+  };
+  const cacheSet = (k, v) => {
+    if (cache.has(k)) cache.delete(k);
+    cache.set(k, v);
+    if (cache.size > CACHE_MAX) cache.delete(cache.keys().next().value);
   };
 
   while (true) {
@@ -232,8 +254,20 @@ async function runWorker() {
       if (enabled.nestedSegwit) tasks.push(["nestedSegwit", kp.nestedSegwitAddress]);
       if (multi)                tasks.push(["multi",        multi.address]);
 
-      const addrs = tasks.map(([, addr]) => addr);
-      const balMap = await getBalances(addrs, cfg.endpoints, cfg.endpointStrategy, epStats, opts);
+      const allAddrs = tasks.map(([, addr]) => addr);
+      const cachedHits = {};
+      const toFetch = [];
+      for (const a of allAddrs) {
+        const c = cacheGet(a);
+        if (c !== undefined) cachedHits[a] = c;
+        else toFetch.push(a);
+      }
+      let balMap = { ...cachedHits };
+      if (toFetch.length > 0) {
+        const fetched = await getBalances(toFetch, cfg.endpoints, cfg.endpointStrategy, epStats, opts);
+        for (const a of toFetch) cacheSet(a, Number(fetched[a] ?? 0));
+        balMap = { ...balMap, ...fetched };
+      }
       tasks.forEach(([key, addr]) => { balances[key] = Number(balMap[addr] ?? 0); });
 
       parentPort.postMessage({ type: "result", workerId: id, kp, multi, balances });
@@ -294,61 +328,45 @@ function printRow(count, workerId, kp, multi, balances, enabled) {
   }
 }
 
-function appendHit(file, text) {
-  appendFileSync(file, text);
+function appendHitLine(file, obj) {
+  appendFileSync(file, JSON.stringify(obj) + "\n");
 }
 
 function handleHit(cfg, kp, multi, balances) {
+  const ts = new Date().toISOString();
   const hits = [];
   if (balances.uncompressed > 0) {
-    hits.push(
-      `Uncompressed Private Key (WIF)\t: ${kp.wifUncompressed}\n` +
-        ` Uncompressed Address\t: ${kp.uncompressedAddress}\n` +
-        ` Balance: ${balances.uncompressed}\n\n`,
-    );
+    hits.push({ ts, type: "uncompressed", address: kp.uncompressedAddress, balance: balances.uncompressed, wif: kp.wifUncompressed, privateKeyHex: kp.privateKeyHex });
   }
   if (balances.compressed > 0) {
-    hits.push(
-      `Compressed Private Key (WIF)\t: ${kp.wifCompressed}\n` +
-        ` Compressed Address\t: ${kp.compressedAddress}\n` +
-        ` Balance: ${balances.compressed}\n\n`,
-    );
+    hits.push({ ts, type: "compressed", address: kp.compressedAddress, balance: balances.compressed, wif: kp.wifCompressed, privateKeyHex: kp.privateKeyHex });
   }
   if (balances.segwit > 0) {
-    hits.push(
-      `Compressed Private Key (WIF)\t: ${kp.wifCompressed}\n` +
-        ` SegWit (bech32) Address\t: ${kp.segwitAddress}\n` +
-        ` Balance: ${balances.segwit}\n\n`,
-    );
+    hits.push({ ts, type: "segwit", address: kp.segwitAddress, balance: balances.segwit, wif: kp.wifCompressed, privateKeyHex: kp.privateKeyHex });
   }
   if (balances.nestedSegwit > 0) {
-    hits.push(
-      `Compressed Private Key (WIF)\t: ${kp.wifCompressed}\n` +
-        ` P2SH-SegWit Address\t: ${kp.nestedSegwitAddress}\n` +
-        ` Balance: ${balances.nestedSegwit}\n\n`,
-    );
+    hits.push({ ts, type: "p2sh-segwit", address: kp.nestedSegwitAddress, balance: balances.nestedSegwit, wif: kp.wifCompressed, privateKeyHex: kp.privateKeyHex });
   }
   if (multi && balances.multi > 0) {
-    hits.push(
-      `Multisig Address\t: ${multi.address}\n` +
-        ` Multisig Private Keys (WIF)\t: ${multi.privateKeysWif.join(", ")}\n` +
-        ` Balance: ${balances.multi}\n\n`,
-    );
+    hits.push({ ts, type: "multisig", address: multi.address, balance: balances.multi, privateKeysWif: multi.privateKeysWif });
   }
   if (hits.length === 0) return false;
-  for (const h of hits) appendHit(cfg.outputFile, h);
+  for (const h of hits) appendHitLine(cfg.outputFile, h);
   console.log("\n!!! You have just rung the bell of BTC Lottery !!!");
   return true;
 }
 
+function defaultState() {
+  return { totalCount: 0, totalHits: 0, totalErrors: 0, totalUptimeMs: 0, runs: 0, endpointStats: {} };
+}
+
 function loadState(file) {
-  if (!file || !existsSync(file)) {
-    return { totalCount: 0, totalHits: 0, totalErrors: 0, totalUptimeMs: 0, runs: 0 };
-  }
+  if (!file || !existsSync(file)) return defaultState();
   try {
-    return JSON.parse(readFileSync(file, "utf8"));
+    const s = JSON.parse(readFileSync(file, "utf8"));
+    return { ...defaultState(), ...s, endpointStats: s.endpointStats ?? {} };
   } catch {
-    return { totalCount: 0, totalHits: 0, totalErrors: 0, totalUptimeMs: 0, runs: 0 };
+    return defaultState();
   }
 }
 
@@ -374,6 +392,30 @@ function normalizeEndpoints(cfg) {
   ];
 }
 
+function applyEnvOverrides(cfg) {
+  const env = process.env;
+  const num = (k, target) => { if (env[k] !== undefined && env[k] !== "") cfg[target] = Number(env[k]); };
+  const bool = (k, target) => { if (env[k] !== undefined) cfg[target] = env[k] === "true" || env[k] === "1"; };
+  const str = (k, target) => { if (env[k] !== undefined && env[k] !== "") cfg[target] = env[k]; };
+  num("WORKER_COUNT", "workerCount");
+  num("PER_ADDRESS_DELAY_MS", "perAddressDelayMs");
+  num("JITTER_MS", "jitterMs");
+  num("ROUND_PAUSE_MS", "roundPauseMs");
+  num("ADDRESSES_PER_ROUND", "addressesPerRound");
+  num("ERROR_BACKOFF_MS", "errorBackoffMs");
+  num("REQUEST_TIMEOUT_MS", "requestTimeoutMs");
+  num("WORK_INTERVAL_MINUTES", "workIntervalMinutes");
+  num("REST_PAUSE_MINUTES", "restPauseMinutes");
+  num("STATS_INTERVAL_MS", "statsIntervalMs");
+  num("BACKUP_INTERVAL_MS", "backupIntervalMs");
+  str("ENDPOINT_STRATEGY", "endpointStrategy");
+  str("OUTPUT_FILE", "outputFile");
+  str("STATE_FILE", "stateFile");
+  bool("VERBOSE", "verbose");
+  bool("PAUSE_ON_HIT", "pauseOnHit");
+  return cfg;
+}
+
 function normalizeAddressTypes(cfg) {
   const def = { uncompressed: true, compressed: true, segwit: true, nestedSegwit: true, multisig: true };
   if (cfg.addressTypes && typeof cfg.addressTypes === "object") {
@@ -384,10 +426,11 @@ function normalizeAddressTypes(cfg) {
 }
 
 async function runMain() {
-  const cfg = loadConfig();
+  const cfg = applyEnvOverrides(loadConfig());
   cfg.endpoints = normalizeEndpoints(cfg);
   cfg.addressTypes = normalizeAddressTypes(cfg);
   cfg.requestTimeoutMs = cfg.requestTimeoutMs ?? 10000;
+  cfg.backupIntervalMs = cfg.backupIntervalMs ?? 3600000;
   if (!Object.values(cfg.addressTypes).some(Boolean)) {
     console.error("Configuration error: at least one address type must be enabled in config.json -> addressTypes.");
     process.exit(1);
@@ -443,16 +486,26 @@ async function runMain() {
   const startedAt = Date.now();
 
   function snapshotPersisted() {
+    const mergedEp = {};
+    for (const k of new Set([...Object.keys(persisted.endpointStats ?? {}), ...Object.keys(stats.endpoints)])) {
+      const p = persisted.endpointStats?.[k] ?? { ok: 0, err: 0 };
+      const s = stats.endpoints[k] ?? { ok: 0, err: 0 };
+      mergedEp[k] = { ok: p.ok + s.ok, err: p.err + s.err };
+    }
     return {
       totalCount: persisted.totalCount + stats.count,
       totalHits: persisted.totalHits + stats.hits,
       totalErrors: persisted.totalErrors + stats.errors,
       totalUptimeMs: persisted.totalUptimeMs + (Date.now() - startedAt),
       runs: persisted.runs,
+      endpointStats: mergedEp,
     };
   }
 
   setInterval(() => saveState(stateFile, snapshotPersisted()), 30000).unref();
+  setInterval(() => {
+    saveState(`${stateFile}.backup`, snapshotPersisted());
+  }, cfg.backupIntervalMs).unref();
   const pauseEvery = cfg.addressesPerRound * cfg.workerCount;
   const statsIntervalMs = (cfg.statsIntervalMs ?? 60000);
 
@@ -517,12 +570,16 @@ async function runMain() {
     });
   }
 
-  const stagger = Math.floor(cfg.perAddressDelayMs / Math.max(1, cfg.workerCount));
-  for (let i = 0; i < cfg.workerCount; i++) {
-    if (i > 0) await sleep(stagger);
-    if (stopping) break;
-    const worker = new Worker(SELF, { workerData: { config: cfg, id: i + 1 } });
-    workers.push(worker);
+  // pausedByCycle tracks the last pause/resume command sent to workers,
+  // so re-spawned workers can be brought back to the same paused state.
+  let pausedByCycle = false;
+
+  function spawnWorker(id) {
+    const worker = new Worker(SELF, { workerData: { config: cfg, id } });
+    if (pausedByCycle) {
+      // Newly spawned workers default to running; immediately pause if cycle is in rest mode.
+      worker.postMessage({ type: "pause" });
+    }
 
     worker.on("message", async (msg) => {
       if (stopping) return;
@@ -560,10 +617,27 @@ async function runMain() {
       }
     });
 
-    worker.on("error", (err) => console.error(`Worker ${i + 1} fatal:`, err));
-    worker.on("exit", (code) =>
-      console.log(`Worker ${i + 1} exited with code ${code}`),
-    );
+    worker.on("error", (err) => console.error(`Worker ${id} fatal:`, err));
+    worker.on("exit", (code) => {
+      if (stopping) return;
+      console.log(`\t[supervisor] worker ${id} exited with code ${code} — respawning in 2s ...`);
+      const idx = workers.indexOf(worker);
+      setTimeout(() => {
+        if (stopping) return;
+        const fresh = spawnWorker(id);
+        if (idx >= 0) workers[idx] = fresh;
+        else workers.push(fresh);
+      }, 2000);
+    });
+
+    return worker;
+  }
+
+  const stagger = Math.floor(cfg.perAddressDelayMs / Math.max(1, cfg.workerCount));
+  for (let i = 0; i < cfg.workerCount; i++) {
+    if (i > 0) await sleep(stagger);
+    if (stopping) break;
+    workers.push(spawnWorker(i + 1));
   }
 
   // Cooldown cycle: run for workIntervalMinutes, then pause all workers for restPauseMinutes.
@@ -580,6 +654,7 @@ async function runMain() {
           `${C.bold} COOLDOWN${C.reset}  pausing all workers for ${restPauseMs / 60000} min ` +
           `(work cycle = ${workIntervalMs / 60000} min)\n${C.yellow}${line}${C.reset}\n`,
         );
+        pausedByCycle = true;
         for (const w of workers) w.postMessage({ type: "pause" });
         await sleep(restPauseMs);
         if (stopping) return;
@@ -588,6 +663,7 @@ async function runMain() {
           `${C.bold} RESUMING${C.reset}  workers continuing for next ${workIntervalMs / 60000} min\n` +
           `${C.yellow}${line}${C.reset}\n`,
         );
+        pausedByCycle = false;
         for (const w of workers) w.postMessage({ type: "resume" });
       }
     })().catch((e) => console.error("cycle error:", e));

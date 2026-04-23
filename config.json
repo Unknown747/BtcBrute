@@ -21,7 +21,8 @@
     "nestedSegwit": true,
     "multisig": false
   },
-  "outputFile": "Lottery_BTC.txt",
+  "outputFile": "Lottery_BTC.jsonl",
+  "backupIntervalMs": 3600000,
   "verbose": true,
   "statsIntervalMs": 60000,
   "pauseOnHit": true,
