@@ -738,6 +738,7 @@ async function runMain() {
   cfg.rangeFile = cfg.rangeFile ?? "Last_Scan.txt";
   cfg.range = {
     start: cfg.range?.start ?? "0000000000000000000000000000000000000000000000000000000000000001",
+    end: cfg.range?.end ?? null,
   };
 
   // Interactive mode selection. ENV `MODE=privkey|mnemonic|range` skips the
@@ -762,6 +763,22 @@ async function runMain() {
   let rangeCursor = mode === "range"
     ? loadRangeCursor(cfg.rangeFile, BigInt("0x" + cfg.range.start))
     : null;
+  // Optional inclusive upper bound. When the cursor passes it the parent
+  // stops handing out work and triggers a clean shutdown.
+  let rangeEnd = null;
+  if (mode === "range" && cfg.range.end) {
+    if (!/^[0-9a-fA-F]{1,64}$/.test(cfg.range.end)) {
+      console.error(`Configuration error: range.end must be 1–64 hex chars, got "${cfg.range.end}"`);
+      process.exit(1);
+    }
+    rangeEnd = BigInt("0x" + cfg.range.end);
+    if (rangeEnd >= SECP256K1_N) rangeEnd = SECP256K1_N - 1n;
+    if (rangeEnd < rangeCursor) {
+      console.error(`Configuration error: range.end (0x${bigIntToHex64(rangeEnd)}) is before current cursor (0x${bigIntToHex64(rangeCursor)}).`);
+      console.error(`Reset by deleting ${cfg.rangeFile} or setting range.start past the end.`);
+      process.exit(1);
+    }
+  }
 
   // Auto-throttle config (resolved here so it can be shown in the banner).
   const autoTune = cfg.autoTune ?? {};
@@ -817,6 +834,12 @@ async function runMain() {
   console.log(row("Scan mode",       `${C.green}${modeLabel}${C.reset}`));
   if (mode === "range") {
     console.log(row("Range cursor",  `${C.cyan}0x${bigIntToHex64(rangeCursor)}${C.reset}  →  ${C.dim}${cfg.rangeFile}${C.reset}`));
+    if (rangeEnd !== null) {
+      const remaining = rangeEnd - rangeCursor + 1n;
+      console.log(row("Range end",   `${C.cyan}0x${bigIntToHex64(rangeEnd)}${C.reset}  (${remaining.toString()} keys remaining)`));
+    } else {
+      console.log(row("Range end",   `${C.dim}none (scan until stopped)${C.reset}`));
+    }
   }
   console.log(row("Run",             `#${persisted.runs}`));
   console.log(row("Cumulative",
@@ -1025,8 +1048,22 @@ async function runMain() {
           worker.postMessage({ type: "rangeChunk", startHex: bigIntToHex64(1n), count: 0 });
           return;
         }
+        // Stop assigning work once the cursor has passed the configured end.
+        if (rangeEnd !== null && rangeCursor > rangeEnd) {
+          worker.postMessage({ type: "rangeChunk", startHex: bigIntToHex64(rangeCursor), count: 0 });
+          if (!stopping) {
+            console.log(`\n${C.green}Range scan complete: cursor reached 0x${bigIntToHex64(rangeEnd)}.${C.reset}`);
+            await stopAll("RANGE COMPLETE");
+          }
+          return;
+        }
+        let count = Math.max(1, Number(msg.count) || 1);
+        // Clamp the chunk so we don't overshoot the configured end.
+        if (rangeEnd !== null) {
+          const remaining = rangeEnd - rangeCursor + 1n;
+          if (BigInt(count) > remaining) count = Number(remaining);
+        }
         const startHex = bigIntToHex64(rangeCursor);
-        const count = Math.max(1, Number(msg.count) || 1);
         rangeCursor = rangeCursor + BigInt(count);
         if (rangeCursor >= SECP256K1_N) rangeCursor = SECP256K1_N - 1n;
         saveRangeCursor(cfg.rangeFile, rangeCursor);

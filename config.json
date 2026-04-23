@@ -9,9 +9,18 @@
   "workIntervalMinutes": 30,
   "restPauseMinutes": 2,
   "endpoints": [
-    { "type": "blockchain", "url": "https://blockchain.info/balance?active=" },
-    { "type": "blockstream", "url": "https://blockstream.info/api/address/" },
-    { "type": "mempool", "url": "https://mempool.space/api/address/" }
+    {
+      "type": "blockchain",
+      "url": "https://blockchain.info/balance?active="
+    },
+    {
+      "type": "blockstream",
+      "url": "https://blockstream.info/api/address/"
+    },
+    {
+      "type": "mempool",
+      "url": "https://mempool.space/api/address/"
+    }
   ],
   "endpointStrategy": "failover",
   "batchKeypairs": 20,
@@ -36,7 +45,11 @@
   },
   "bip39": {
     "strength": 128,
-    "paths": ["bip44", "bip49", "bip84"],
+    "paths": [
+      "bip44",
+      "bip49",
+      "bip84"
+    ],
     "addressesPerPath": 5,
     "mnemonicsPerBatch": 1
   },
@@ -45,5 +58,8 @@
   "verbose": true,
   "statsIntervalMs": 60000,
   "pauseOnHit": true,
-  "stateFile": "state.json"
+  "stateFile": "state.json",
+  "range": {
+    "start": "0000000000000000000000000000000000000000000000000000000000000001"
+  }
 }
