@@ -124,28 +124,27 @@ async function getFinalBalance(address, endpoints) {
 async function runWorker() {
   const cfg = workerData.config;
   const id = workerData.id;
+  const enabled = cfg.addressTypes;
 
   while (true) {
     try {
       const kp = makeKeyPair();
-      const multi = cfg.checkMultisig ? makeMultisigAddress() : null;
+      const multi = enabled.multisig ? makeMultisigAddress() : null;
 
-      const lookups = [
-        getFinalBalance(kp.uncompressedAddress, cfg.endpoints),
-        getFinalBalance(kp.compressedAddress, cfg.endpoints),
-        getFinalBalance(kp.segwitAddress, cfg.endpoints),
-        getFinalBalance(kp.nestedSegwitAddress, cfg.endpoints),
-      ];
-      if (multi) lookups.push(getFinalBalance(multi.address, cfg.endpoints));
-
-      const results = await Promise.all(lookups);
+      const tasks = [];
       const balances = {
-        uncompressed: results[0],
-        compressed: results[1],
-        segwit: results[2],
-        nestedSegwit: results[3],
-        multi: multi ? results[4] : 0,
+        uncompressed: 0, compressed: 0, segwit: 0, nestedSegwit: 0, multi: 0,
       };
+      if (enabled.uncompressed) tasks.push(["uncompressed", kp.uncompressedAddress]);
+      if (enabled.compressed)   tasks.push(["compressed",   kp.compressedAddress]);
+      if (enabled.segwit)       tasks.push(["segwit",       kp.segwitAddress]);
+      if (enabled.nestedSegwit) tasks.push(["nestedSegwit", kp.nestedSegwitAddress]);
+      if (multi)                tasks.push(["multi",        multi.address]);
+
+      const results = await Promise.all(
+        tasks.map(([, addr]) => getFinalBalance(addr, cfg.endpoints)),
+      );
+      tasks.forEach(([key], i) => { balances[key] = results[i]; });
 
       parentPort.postMessage({ type: "result", workerId: id, kp, multi, balances });
     } catch (err) {
@@ -178,14 +177,14 @@ function padLeft(s, n) {
   return s.length >= n ? s : " ".repeat(n - s.length) + s;
 }
 
-function printRow(count, workerId, kp, multi, balances) {
-  const rows = [
-    { type: "uncompressed", addr: kp.uncompressedAddress, bal: balances.uncompressed },
-    { type: "compressed",   addr: kp.compressedAddress,   bal: balances.compressed   },
-    { type: "segwit",       addr: kp.segwitAddress,       bal: balances.segwit       },
-    { type: "p2sh-segwit",  addr: kp.nestedSegwitAddress, bal: balances.nestedSegwit },
-  ];
-  if (multi) rows.push({ type: "multisig", addr: multi.address, bal: balances.multi });
+function printRow(count, workerId, kp, multi, balances, enabled) {
+  const rows = [];
+  if (enabled.uncompressed) rows.push({ type: "uncompressed", addr: kp.uncompressedAddress, bal: balances.uncompressed });
+  if (enabled.compressed)   rows.push({ type: "compressed",   addr: kp.compressedAddress,   bal: balances.compressed   });
+  if (enabled.segwit)       rows.push({ type: "segwit",       addr: kp.segwitAddress,       bal: balances.segwit       });
+  if (enabled.nestedSegwit) rows.push({ type: "p2sh-segwit",  addr: kp.nestedSegwitAddress, bal: balances.nestedSegwit });
+  if (multi)                rows.push({ type: "multisig",     addr: multi.address,           bal: balances.multi        });
+  if (rows.length === 0) return;
 
   const header = `${C.gray}┌─ ${C.bold}#${padLeft(count, 6)}${C.reset}${C.gray} ─ worker ${workerId} ${"─".repeat(58)}${C.reset}`;
   console.log(header);
@@ -277,9 +276,19 @@ function normalizeEndpoints(cfg) {
   ];
 }
 
+function normalizeAddressTypes(cfg) {
+  const def = { uncompressed: true, compressed: true, segwit: true, nestedSegwit: true, multisig: true };
+  if (cfg.addressTypes && typeof cfg.addressTypes === "object") {
+    return { ...def, ...cfg.addressTypes };
+  }
+  if (cfg.checkMultisig === false) def.multisig = false;
+  return def;
+}
+
 async function runMain() {
   const cfg = loadConfig();
   cfg.endpoints = normalizeEndpoints(cfg);
+  cfg.addressTypes = normalizeAddressTypes(cfg);
   const stateFile = cfg.stateFile ?? "state.json";
   const persisted = loadState(stateFile);
   persisted.runs = (persisted.runs ?? 0) + 1;
@@ -296,7 +305,9 @@ async function runMain() {
   console.log(row("Delay / address", `${cfg.perAddressDelayMs} ms`));
   console.log(row("Round pause",     `${cfg.roundPauseMs} ms (every ${cfg.addressesPerRound * cfg.workerCount} addresses)`));
   console.log(row("Stats interval",  `${cfg.statsIntervalMs ?? 60000} ms`));
-  console.log(row("Multisig check",  cfg.checkMultisig ? `${C.green}ON${C.reset}` : `${C.dim}off${C.reset}`));
+  const enabledTypes = Object.entries(cfg.addressTypes)
+    .filter(([, v]) => v).map(([k]) => k).join(", ") || "(none)";
+  console.log(row("Address types",   enabledTypes));
   console.log(row("Pause on hit",    cfg.pauseOnHit ? `${C.green}ON${C.reset}` : `${C.dim}off${C.reset}`));
   console.log(row("Output file",     cfg.outputFile));
   console.log(row("State file",      stateFile));
@@ -406,7 +417,7 @@ async function runMain() {
         }
       }
       if (!hit && cfg.verbose) {
-        printRow(count, msg.workerId, msg.kp, msg.multi, msg.balances);
+        printRow(count, msg.workerId, msg.kp, msg.multi, msg.balances, cfg.addressTypes);
       }
 
       if (cfg.roundPauseMs > 0 && count % pauseEvery === 0) {

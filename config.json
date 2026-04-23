@@ -8,8 +8,14 @@
     { "type": "blockchain", "url": "https://blockchain.info/balance?active=" },
     { "type": "blockstream", "url": "https://blockstream.info/api/address/" }
   ],
+  "addressTypes": {
+    "uncompressed": false,
+    "compressed": true,
+    "segwit": true,
+    "nestedSegwit": true,
+    "multisig": false
+  },
   "outputFile": "Lottery_BTC.txt",
-  "checkMultisig": true,
   "verbose": true,
   "statsIntervalMs": 60000,
   "pauseOnHit": true,
