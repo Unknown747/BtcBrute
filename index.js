@@ -192,6 +192,11 @@ async function runWorker() {
   const id = workerData.id;
   const enabled = cfg.addressTypes;
   const epStats = {};
+  let paused = false;
+  parentPort.on("message", (m) => {
+    if (m?.type === "pause") paused = true;
+    else if (m?.type === "resume") paused = false;
+  });
   const flushEp = () => {
     const snap = {};
     for (const k of Object.keys(epStats)) {
@@ -210,6 +215,9 @@ async function runWorker() {
   };
 
   while (true) {
+    if (paused) {
+      while (paused) await sleep(1000);
+    }
     try {
       const kp = makeKeyPair();
       const multi = enabled.multisig ? makeMultisigAddress() : null;
@@ -404,6 +412,9 @@ async function runMain() {
     .filter(([, v]) => v).map(([k]) => k).join(", ") || "(none)";
   console.log(row("Address types",   enabledTypes));
   console.log(row("Pause on hit",    cfg.pauseOnHit ? `${C.green}ON${C.reset}` : `${C.dim}off${C.reset}`));
+  if ((cfg.workIntervalMinutes ?? 0) > 0 && (cfg.restPauseMinutes ?? 0) > 0) {
+    console.log(row("Cooldown cycle", `${cfg.workIntervalMinutes} min on / ${cfg.restPauseMinutes} min off`));
+  }
   console.log(row("Output file",     cfg.outputFile));
   console.log(row("State file",      stateFile));
   console.log(row("Endpoints",       cfg.endpoints.map((e) => e.type).join(cfg.endpointStrategy === "round-robin" ? " ⇄ " : cfg.endpointStrategy === "random" ? " ? " : " → ")));
@@ -553,6 +564,33 @@ async function runMain() {
     worker.on("exit", (code) =>
       console.log(`Worker ${i + 1} exited with code ${code}`),
     );
+  }
+
+  // Cooldown cycle: run for workIntervalMinutes, then pause all workers for restPauseMinutes.
+  const workIntervalMs = (cfg.workIntervalMinutes ?? 0) * 60000;
+  const restPauseMs = (cfg.restPauseMinutes ?? 0) * 60000;
+  if (workIntervalMs > 0 && restPauseMs > 0) {
+    (async () => {
+      while (!stopping) {
+        await sleep(workIntervalMs);
+        if (stopping) return;
+        const line = "─".repeat(78);
+        console.log(
+          `\n${C.yellow}${line}${C.reset}\n` +
+          `${C.bold} COOLDOWN${C.reset}  pausing all workers for ${restPauseMs / 60000} min ` +
+          `(work cycle = ${workIntervalMs / 60000} min)\n${C.yellow}${line}${C.reset}\n`,
+        );
+        for (const w of workers) w.postMessage({ type: "pause" });
+        await sleep(restPauseMs);
+        if (stopping) return;
+        console.log(
+          `\n${C.yellow}${line}${C.reset}\n` +
+          `${C.bold} RESUMING${C.reset}  workers continuing for next ${workIntervalMs / 60000} min\n` +
+          `${C.yellow}${line}${C.reset}\n`,
+        );
+        for (const w of workers) w.postMessage({ type: "resume" });
+      }
+    })().catch((e) => console.error("cycle error:", e));
   }
 }
 

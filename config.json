@@ -1,11 +1,13 @@
 {
-  "workerCount": 6,
+  "workerCount": 3,
   "addressesPerRound": 60,
-  "perAddressDelayMs": 500,
-  "jitterMs": 200,
-  "roundPauseMs": 15000,
+  "perAddressDelayMs": 1500,
+  "jitterMs": 400,
+  "roundPauseMs": 30000,
   "errorBackoffMs": 15000,
   "requestTimeoutMs": 10000,
+  "workIntervalMinutes": 30,
+  "restPauseMinutes": 2,
   "endpoints": [
     { "type": "blockchain", "url": "https://blockchain.info/balance?active=" },
     { "type": "blockstream", "url": "https://blockstream.info/api/address/" },
