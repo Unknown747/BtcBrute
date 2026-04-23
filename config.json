@@ -5,6 +5,7 @@
   "jitterMs": 500,
   "roundPauseMs": 30000,
   "errorBackoffMs": 15000,
+  "requestTimeoutMs": 10000,
   "endpoints": [
     { "type": "blockchain", "url": "https://blockchain.info/balance?active=" },
     { "type": "blockstream", "url": "https://blockstream.info/api/address/" },

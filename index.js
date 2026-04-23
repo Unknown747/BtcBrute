@@ -12,7 +12,7 @@
  * is effectively zero (~1 in 2^160).
  */
 
-import { appendFileSync, readFileSync, writeFileSync, existsSync } from "node:fs";
+import { appendFileSync, readFileSync, writeFileSync, existsSync, renameSync } from "node:fs";
 import { setTimeout as sleep } from "node:timers/promises";
 import { Worker, isMainThread, parentPort, workerData } from "node:worker_threads";
 import { fileURLToPath } from "node:url";
@@ -81,26 +81,37 @@ function makeMultisigAddress() {
 }
 
 const ENDPOINT_PARSERS = {
-  blockchain: async (res, address) => {
+  blockchain: async (res, addresses) => {
     const data = await res.json();
-    return Number(data[address].final_balance);
+    const out = {};
+    for (const a of addresses) {
+      out[a] = Number(data[a]?.final_balance ?? 0);
+    }
+    return out;
   },
-  blockstream: async (res) => {
+  blockstream: async (res, addresses) => {
     const data = await res.json();
     const c = data.chain_stats ?? { funded_txo_sum: 0, spent_txo_sum: 0 };
     const m = data.mempool_stats ?? { funded_txo_sum: 0, spent_txo_sum: 0 };
-    return (
-      (c.funded_txo_sum - c.spent_txo_sum) +
-      (m.funded_txo_sum - m.spent_txo_sum)
-    );
+    return {
+      [addresses[0]]:
+        (c.funded_txo_sum - c.spent_txo_sum) +
+        (m.funded_txo_sum - m.spent_txo_sum),
+    };
   },
 };
 ENDPOINT_PARSERS.mempool = ENDPOINT_PARSERS.blockstream;
 
-function buildEndpointUrl(endpoint, address) {
-  if (endpoint.type === "blockchain") return `${endpoint.url}${address}`;
-  if (endpoint.type === "blockstream") return `${endpoint.url}${address}`;
-  if (endpoint.type === "mempool") return `${endpoint.url}${address}`;
+const ENDPOINT_BATCH = {
+  blockchain: true,
+  blockstream: false,
+  mempool: false,
+};
+
+function buildEndpointUrl(endpoint, addresses) {
+  if (endpoint.type === "blockchain") return `${endpoint.url}${addresses.join("|")}`;
+  if (endpoint.type === "blockstream") return `${endpoint.url}${addresses[0]}`;
+  if (endpoint.type === "mempool") return `${endpoint.url}${addresses[0]}`;
   throw new Error(`Unknown endpoint type: ${endpoint.type}`);
 }
 
@@ -117,25 +128,61 @@ function orderEndpoints(endpoints, strategy) {
   return endpoints;
 }
 
-async function getFinalBalance(address, endpoints, strategy, epStats) {
+async function fetchOnce(url, timeoutMs) {
+  const res = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) });
+  if (!res.ok) {
+    const err = new Error(`HTTP ${res.status}`);
+    err.status = res.status;
+    throw err;
+  }
+  return res;
+}
+
+/**
+ * Fetch balances for one or more addresses through the configured endpoints.
+ * - Tries endpoints in order (round-robin / random / failover).
+ * - Batches addresses into a single request when the endpoint supports it.
+ * - One automatic retry on transient network/5xx errors before failing over.
+ * - Honors HTTP 429 with a longer backoff.
+ */
+async function getBalances(addresses, endpoints, strategy, epStats, opts) {
+  const timeoutMs = opts.requestTimeoutMs;
+  const errorBackoffMs = opts.errorBackoffMs;
   let lastErr;
+
   for (const endpoint of orderEndpoints(endpoints, strategy)) {
     const slot = epStats[endpoint.type] ?? (epStats[endpoint.type] = { ok: 0, err: 0 });
+    const parser = ENDPOINT_PARSERS[endpoint.type];
+    const supportsBatch = ENDPOINT_BATCH[endpoint.type];
+    const groups = supportsBatch ? [addresses] : addresses.map((a) => [a]);
+
     try {
-      const res = await fetch(buildEndpointUrl(endpoint, address));
-      if (!res.ok) {
-        throw new Error(`${endpoint.type} responded ${res.status}`);
+      const merged = {};
+      for (const group of groups) {
+        const url = buildEndpointUrl(endpoint, group);
+        let res;
+        try {
+          res = await fetchOnce(url, timeoutMs);
+        } catch (err) {
+          // 1 retry for transient failures (timeout, network, 5xx). Skip retry on 4xx (except 429).
+          const transient =
+            !err.status || err.status >= 500 || err.status === 429 || err.name === "TimeoutError" || err.name === "AbortError";
+          if (!transient) throw err;
+          const wait = err.status === 429 ? errorBackoffMs : Math.min(errorBackoffMs, 3000);
+          await sleep(wait);
+          res = await fetchOnce(url, timeoutMs);
+        }
+        const part = await parser(res, group);
+        Object.assign(merged, part);
       }
-      const parser = ENDPOINT_PARSERS[endpoint.type];
-      const value = await parser(res, address);
       slot.ok += 1;
-      return value;
+      return merged;
     } catch (err) {
       slot.err += 1;
       lastErr = err;
     }
   }
-  throw new Error(`all endpoints failed for ${address}: ${lastErr?.message}`);
+  throw new Error(`all endpoints failed: ${lastErr?.message}`);
 }
 
 /* -------------------------------- Worker -------------------------------- */
@@ -157,6 +204,11 @@ async function runWorker() {
     }
   };
 
+  const opts = {
+    requestTimeoutMs: cfg.requestTimeoutMs ?? 10000,
+    errorBackoffMs: cfg.errorBackoffMs ?? 15000,
+  };
+
   while (true) {
     try {
       const kp = makeKeyPair();
@@ -172,10 +224,9 @@ async function runWorker() {
       if (enabled.nestedSegwit) tasks.push(["nestedSegwit", kp.nestedSegwitAddress]);
       if (multi)                tasks.push(["multi",        multi.address]);
 
-      const results = await Promise.all(
-        tasks.map(([, addr]) => getFinalBalance(addr, cfg.endpoints, cfg.endpointStrategy, epStats)),
-      );
-      tasks.forEach(([key], i) => { balances[key] = results[i]; });
+      const addrs = tasks.map(([, addr]) => addr);
+      const balMap = await getBalances(addrs, cfg.endpoints, cfg.endpointStrategy, epStats, opts);
+      tasks.forEach(([key, addr]) => { balances[key] = Number(balMap[addr] ?? 0); });
 
       parentPort.postMessage({ type: "result", workerId: id, kp, multi, balances });
       flushEp();
@@ -296,7 +347,9 @@ function loadState(file) {
 function saveState(file, state) {
   if (!file) return;
   try {
-    writeFileSync(file, JSON.stringify(state, null, 2));
+    const tmp = `${file}.tmp`;
+    writeFileSync(tmp, JSON.stringify(state, null, 2));
+    renameSync(tmp, file);
   } catch (err) {
     console.log(`\t[state] save failed: ${err.message}`);
   }
@@ -326,6 +379,11 @@ async function runMain() {
   const cfg = loadConfig();
   cfg.endpoints = normalizeEndpoints(cfg);
   cfg.addressTypes = normalizeAddressTypes(cfg);
+  cfg.requestTimeoutMs = cfg.requestTimeoutMs ?? 10000;
+  if (!Object.values(cfg.addressTypes).some(Boolean)) {
+    console.error("Configuration error: at least one address type must be enabled in config.json -> addressTypes.");
+    process.exit(1);
+  }
   const stateFile = cfg.stateFile ?? "state.json";
   const persisted = loadState(stateFile);
   persisted.runs = (persisted.runs ?? 0) + 1;
@@ -471,6 +529,7 @@ async function runMain() {
       const hit = handleHit(cfg, msg.kp, msg.multi, msg.balances);
       if (hit) {
         stats.hits += 1;
+        saveState(stateFile, snapshotPersisted());
         if (cfg.pauseOnHit) {
           await stopAll("HIT FOUND");
           return;
