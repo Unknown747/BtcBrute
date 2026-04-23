@@ -743,9 +743,9 @@ async function promptMode(cfg) {
   }
   console.log("");
   console.log(`${C.yellow}Select scan mode:${C.reset}`);
-  console.log("  1) Random PrivateKey   (fast brute-force)");
-  console.log("  2) Random BIP39 Mnemonic   (12-word, derives BIP44/49/84)");
-  console.log(`  3) Sequential Range   (resumes from ${C.cyan}${cfg.rangeFile ?? "Last_Scan.txt"}${C.reset})`);
+  console.log("  1) Privatekey Scan");
+  console.log("  2) Mnemonic");
+  console.log("  3) Sequential Range");
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
   let choice;
   try { choice = (await rl.question("Choice [1/2/3] (default 1): ")).trim().toLowerCase(); }
