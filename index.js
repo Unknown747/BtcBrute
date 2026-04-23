@@ -161,6 +161,10 @@ async function fetchOnce(url, timeoutMs) {
  * - One automatic retry on transient network/5xx errors before failing over.
  * - Honors HTTP 429 with a longer backoff.
  */
+function newSlot() {
+  return { ok: 0, err: 0, rl429: 0, totalMs: 0, msCount: 0 };
+}
+
 async function getBalances(addresses, endpoints, strategy, epStats, opts, cooldownUntil, batchChunkSize) {
   const timeoutMs = opts.requestTimeoutMs;
   const errorBackoffMs = opts.errorBackoffMs;
@@ -171,7 +175,7 @@ async function getBalances(addresses, endpoints, strategy, epStats, opts, cooldo
 
   const ordered = orderEndpoints(filterCooling(endpoints, cooldownUntil), strategy);
   for (const endpoint of ordered) {
-    const slot = epStats[endpoint.type] ?? (epStats[endpoint.type] = { ok: 0, err: 0 });
+    const slot = epStats[endpoint.type] ?? (epStats[endpoint.type] = newSlot());
     const parser = ENDPOINT_PARSERS[endpoint.type];
     const supportsBatch = ENDPOINT_BATCH[endpoint.type];
     let groups;
@@ -189,10 +193,12 @@ async function getBalances(addresses, endpoints, strategy, epStats, opts, cooldo
       for (const group of groups) {
         const url = buildEndpointUrl(endpoint, group);
         let res;
+        const t0 = Date.now();
         try {
           res = await fetchOnce(url, timeoutMs);
         } catch (err) {
           if (err.status === 429) {
+            slot.rl429 += 1;
             cooldownUntil[endpoint.type] = Date.now() + rateLimitCooldownMs;
             throw err; // immediately fail over to next endpoint
           }
@@ -204,6 +210,8 @@ async function getBalances(addresses, endpoints, strategy, epStats, opts, cooldo
           res = await fetchOnce(url, timeoutMs);
         }
         const part = await parser(res, group);
+        slot.totalMs += Date.now() - t0;
+        slot.msCount += 1;
         Object.assign(merged, part);
       }
       slot.ok += 1;
@@ -224,16 +232,22 @@ async function runWorker() {
   const enabled = cfg.addressTypes;
   const epStats = {};
   let paused = false;
+  // currentDelay starts from config but can be retuned at runtime via
+  // {type:"setDelay"} messages from the parent (auto-throttle).
+  let currentDelay = cfg.perAddressDelayMs;
   parentPort.on("message", (m) => {
     if (m?.type === "pause") paused = true;
     else if (m?.type === "resume") paused = false;
+    else if (m?.type === "setDelay" && Number.isFinite(m.value)) {
+      currentDelay = Math.max(0, m.value);
+    }
   });
   const flushEp = () => {
     const snap = {};
     for (const k of Object.keys(epStats)) {
-      snap[k] = { ok: epStats[k].ok, err: epStats[k].err };
-      epStats[k].ok = 0;
-      epStats[k].err = 0;
+      const s = epStats[k];
+      snap[k] = { ok: s.ok, err: s.err, rl429: s.rl429, totalMs: s.totalMs, msCount: s.msCount };
+      s.ok = 0; s.err = 0; s.rl429 = 0; s.totalMs = 0; s.msCount = 0;
     }
     if (Object.keys(snap).length) {
       parentPort.postMessage({ type: "endpointStats", workerId: id, snap });
@@ -329,9 +343,10 @@ async function runWorker() {
       await sleep(cfg.errorBackoffMs);
     }
     // perAddressDelayMs is per *keypair*; scale by batch size so request
-    // pacing stays roughly the same regardless of batch size.
+    // pacing stays roughly the same regardless of batch size. Auto-throttle
+    // mutates currentDelay at runtime based on observed error rate.
     const jitter = cfg.jitterMs ?? 0;
-    const base = cfg.perAddressDelayMs * batchKeypairs;
+    const base = currentDelay * batchKeypairs;
     const wait = jitter > 0
       ? base + Math.floor((Math.random() * 2 - 1) * jitter)
       : base;
@@ -491,6 +506,16 @@ async function runMain() {
   cfg.batchKeypairs = Math.max(1, cfg.batchKeypairs ?? 1);
   cfg.batchChunkSize = Math.max(1, cfg.batchChunkSize ?? 50);
   cfg.rateLimitCooldownMs = cfg.rateLimitCooldownMs ?? 60000;
+
+  // Auto-throttle config (resolved here so it can be shown in the banner).
+  const autoTune = cfg.autoTune ?? {};
+  const tuneEnabled = autoTune.enabled !== false; // default on
+  const minDelay = Math.max(0, autoTune.minDelayMs ?? 200);
+  const maxDelay = Math.max(minDelay, autoTune.maxDelayMs ?? 10000);
+  const upThreshold = autoTune.upErrorRate ?? 0.10;
+  const downThreshold = autoTune.downErrorRate ?? 0.0;
+  const upFactor = autoTune.upFactor ?? 1.5;
+  const downFactor = autoTune.downFactor ?? 0.9;
   if (!Object.values(cfg.addressTypes).some(Boolean)) {
     console.error("Configuration error: at least one address type must be enabled in config.json -> addressTypes.");
     process.exit(1);
@@ -524,6 +549,9 @@ async function runMain() {
   console.log(row("Endpoint strategy", cfg.endpointStrategy ?? "failover"));
   console.log(row("Batch keypairs",  `${cfg.batchKeypairs} per request (chunk ≤ ${cfg.batchChunkSize} addrs)`));
   console.log(row("Rate-limit cool", `${cfg.rateLimitCooldownMs / 1000}s on HTTP 429`));
+  console.log(row("Auto-throttle",   tuneEnabled
+    ? `${C.green}ON${C.reset} delay ${cfg.perAddressDelayMs}ms (range ${minDelay}–${maxDelay}ms)`
+    : `${C.dim}off${C.reset}`));
   console.log(row("Run",             `#${persisted.runs}`));
   console.log(row("Cumulative",
     `total=${persisted.totalCount} hits=${persisted.totalHits} errors=${persisted.totalErrors} uptime=${(persisted.totalUptimeMs / 60000).toFixed(1)}min`));
@@ -535,24 +563,45 @@ async function runMain() {
     errors: 0,
     hits: 0,
     lastSnapshotCount: 0,
+    lastSnapshotErrors: 0,
     lastSnapshotAt: Date.now(),
     endpoints: {},
+    recentErrors: [],   // ring buffer of recent worker error messages
+    errorCounts: {},    // tally of error messages for shutdown summary
   };
+  const RECENT_ERR_MAX = 20;
+  function recordError(message) {
+    stats.recentErrors.push({ ts: Date.now(), message });
+    if (stats.recentErrors.length > RECENT_ERR_MAX) stats.recentErrors.shift();
+    stats.errorCounts[message] = (stats.errorCounts[message] ?? 0) + 1;
+  }
   function bumpEndpoint(snap) {
     for (const [name, val] of Object.entries(snap)) {
-      const slot = stats.endpoints[name] ?? (stats.endpoints[name] = { ok: 0, err: 0 });
-      slot.ok += val.ok;
-      slot.err += val.err;
+      const slot = stats.endpoints[name] ?? (stats.endpoints[name] = {
+        ok: 0, err: 0, rl429: 0, totalMs: 0, msCount: 0,
+      });
+      slot.ok += val.ok ?? 0;
+      slot.err += val.err ?? 0;
+      slot.rl429 += val.rl429 ?? 0;
+      slot.totalMs += val.totalMs ?? 0;
+      slot.msCount += val.msCount ?? 0;
     }
   }
+
+  // currentDelay is what we last broadcast to workers (mutated by auto-tune).
+  let currentDelay = cfg.perAddressDelayMs;
   const startedAt = Date.now();
 
   function snapshotPersisted() {
     const mergedEp = {};
     for (const k of new Set([...Object.keys(persisted.endpointStats ?? {}), ...Object.keys(stats.endpoints)])) {
-      const p = persisted.endpointStats?.[k] ?? { ok: 0, err: 0 };
-      const s = stats.endpoints[k] ?? { ok: 0, err: 0 };
-      mergedEp[k] = { ok: p.ok + s.ok, err: p.err + s.err };
+      const p = persisted.endpointStats?.[k] ?? { ok: 0, err: 0, rl429: 0 };
+      const s = stats.endpoints[k] ?? { ok: 0, err: 0, rl429: 0 };
+      mergedEp[k] = {
+        ok: (p.ok ?? 0) + (s.ok ?? 0),
+        err: (p.err ?? 0) + (s.err ?? 0),
+        rl429: (p.rl429 ?? 0) + (s.rl429 ?? 0),
+      };
     }
     return {
       totalCount: persisted.totalCount + stats.count,
@@ -571,20 +620,48 @@ async function runMain() {
   const pauseEvery = cfg.addressesPerRound * cfg.workerCount;
   const statsIntervalMs = (cfg.statsIntervalMs ?? 60000);
 
+  function broadcastDelay(value) {
+    for (const w of workers) {
+      try { w.postMessage({ type: "setDelay", value }); } catch {}
+    }
+  }
+
   if (statsIntervalMs > 0) {
     setInterval(() => {
       const now = Date.now();
       const totalElapsedMin = (now - startedAt) / 60000;
       const windowMin = (now - stats.lastSnapshotAt) / 60000;
       const windowDelta = stats.count - stats.lastSnapshotCount;
+      const windowErrDelta = stats.errors - stats.lastSnapshotErrors;
       const windowRate = windowMin > 0 ? (windowDelta / windowMin).toFixed(1) : "0.0";
       const overallRate = totalElapsedMin > 0 ? (stats.count / totalElapsedMin).toFixed(1) : "0.0";
+
+      // Auto-tune: combine worker errors (window) + endpoint failovers (last
+      // window we don't track separately, so approximate via overall rates).
+      let tuneNote = "";
+      if (tuneEnabled) {
+        const windowAttempts = windowDelta + windowErrDelta;
+        const errRate = windowAttempts > 0 ? windowErrDelta / windowAttempts : 0;
+        const prev = currentDelay;
+        if (errRate >= upThreshold) {
+          currentDelay = Math.min(maxDelay, Math.round(currentDelay * upFactor));
+        } else if (errRate <= downThreshold && currentDelay > minDelay) {
+          currentDelay = Math.max(minDelay, Math.round(currentDelay * downFactor));
+        }
+        if (currentDelay !== prev) {
+          broadcastDelay(currentDelay);
+          tuneNote = `  ${C.yellow}delay ${prev}→${currentDelay}ms${C.reset}`;
+        }
+      }
+
       const line = "─".repeat(78);
       const epParts = Object.entries(stats.endpoints).map(([name, s]) => {
         const total = s.ok + s.err;
         const errRate = total > 0 ? ((s.err / total) * 100).toFixed(0) : "0";
         const errCol = s.err === 0 ? C.green : (s.err / Math.max(1, total) > 0.2 ? "\x1b[31m" : C.yellow);
-        return `${C.cyan}${name}${C.reset} ${s.ok}ok/${errCol}${s.err}err${C.reset} (${errRate}%)`;
+        const avgMs = s.msCount > 0 ? Math.round(s.totalMs / s.msCount) : 0;
+        const rl = s.rl429 > 0 ? ` ${C.yellow}429×${s.rl429}${C.reset}` : "";
+        return `${C.cyan}${name}${C.reset} ${s.ok}ok/${errCol}${s.err}err${C.reset} (${errRate}%, ~${avgMs}ms)${rl}`;
       }).join("  ");
       console.log(
         `\n${C.yellow}${line}${C.reset}\n` +
@@ -593,11 +670,12 @@ async function runMain() {
           `${C.cyan}hits${C.reset} ${stats.hits}  ` +
           `${C.cyan}errors${C.reset} ${stats.errors}  ` +
           `${C.cyan}rate${C.reset} ${windowRate}/min (avg ${overallRate}/min)  ` +
-          `${C.cyan}uptime${C.reset} ${totalElapsedMin.toFixed(1)}min` +
+          `${C.cyan}uptime${C.reset} ${totalElapsedMin.toFixed(1)}min${tuneNote}` +
           (epParts ? `\n ENDPOINTS  ${epParts}` : "") +
           `\n${C.yellow}${line}${C.reset}\n`,
       );
       stats.lastSnapshotCount = stats.count;
+      stats.lastSnapshotErrors = stats.errors;
       stats.lastSnapshotAt = now;
     }, statsIntervalMs).unref();
   }
@@ -609,10 +687,39 @@ async function runMain() {
     const totalElapsedMin = (Date.now() - startedAt) / 60000;
     const overallRate = totalElapsedMin > 0 ? (stats.count / totalElapsedMin).toFixed(1) : "0.0";
     const snap = snapshotPersisted();
-    console.log(
-      `\n\t==== FINAL STATS (${reason}) ==== this run: total=${stats.count} hits=${stats.hits} errors=${stats.errors} | rate=${overallRate}/min | uptime=${totalElapsedMin.toFixed(1)}min\n` +
-        `\t==== CUMULATIVE (${snap.runs} runs) ==== total=${snap.totalCount} hits=${snap.totalHits} errors=${snap.totalErrors} uptime=${(snap.totalUptimeMs / 60000).toFixed(1)}min\n`,
-    );
+    const dline = "═".repeat(78);
+    const sline = "─".repeat(78);
+    console.log(`\n${C.yellow}${dline}${C.reset}`);
+    console.log(`${C.bold} FINAL STATS (${reason})${C.reset}`);
+    console.log(`${C.yellow}${dline}${C.reset}`);
+    console.log(` this run     total=${stats.count}  hits=${stats.hits}  errors=${stats.errors}  rate=${overallRate}/min  uptime=${totalElapsedMin.toFixed(1)}min  finalDelay=${currentDelay}ms`);
+    console.log(` cumulative   runs=${snap.runs}  total=${snap.totalCount}  hits=${snap.totalHits}  errors=${snap.totalErrors}  uptime=${(snap.totalUptimeMs / 60000).toFixed(1)}min`);
+
+    const epEntries = Object.entries(stats.endpoints);
+    if (epEntries.length > 0) {
+      console.log(`${C.gray}${sline}${C.reset}`);
+      console.log(` ${C.bold}per-endpoint (this run)${C.reset}`);
+      for (const [name, s] of epEntries) {
+        const total = s.ok + s.err;
+        const errPct = total > 0 ? ((s.err / total) * 100).toFixed(1) : "0.0";
+        const avgMs = s.msCount > 0 ? Math.round(s.totalMs / s.msCount) : 0;
+        console.log(
+          `   ${C.cyan}${pad(name, 12)}${C.reset} ` +
+          `ok=${pad(s.ok, 6)} err=${pad(s.err, 5)} (${pad(errPct + "%", 6)}) ` +
+          `avg=${pad(avgMs + "ms", 7)} 429×${s.rl429}`,
+        );
+      }
+    }
+
+    const errEntries = Object.entries(stats.errorCounts).sort((a, b) => b[1] - a[1]).slice(0, 5);
+    if (errEntries.length > 0) {
+      console.log(`${C.gray}${sline}${C.reset}`);
+      console.log(` ${C.bold}top worker errors (this run)${C.reset}`);
+      for (const [msg, n] of errEntries) {
+        console.log(`   ${pad(`×${n}`, 6)} ${msg}`);
+      }
+    }
+    console.log(`${C.yellow}${dline}${C.reset}\n`);
   }
 
   async function stopAll(reason) {
@@ -651,6 +758,7 @@ async function runMain() {
       }
       if (msg.type === "error") {
         stats.errors += 1;
+        recordError(msg.message);
         console.log(`\t[worker ${msg.workerId}] error: ${msg.message}`);
         return;
       }

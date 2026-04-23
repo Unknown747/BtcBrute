@@ -17,6 +17,15 @@
   "batchKeypairs": 20,
   "batchChunkSize": 50,
   "rateLimitCooldownMs": 60000,
+  "autoTune": {
+    "enabled": true,
+    "minDelayMs": 200,
+    "maxDelayMs": 10000,
+    "upErrorRate": 0.1,
+    "downErrorRate": 0,
+    "upFactor": 1.5,
+    "downFactor": 0.9
+  },
   "addressTypes": {
     "uncompressed": false,
     "compressed": true,
