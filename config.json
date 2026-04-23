@@ -1,0 +1,11 @@
+{
+  "workerCount": 4,
+  "addressesPerRound": 20,
+  "perAddressDelayMs": 3000,
+  "roundPauseMs": 60000,
+  "errorBackoffMs": 15000,
+  "balanceApiUrl": "https://blockchain.info/balance?active=",
+  "outputFile": "Lottery_BTC.txt",
+  "checkMultisig": true,
+  "verbose": true
+}
