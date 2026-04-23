@@ -117,17 +117,21 @@ function orderEndpoints(endpoints, strategy) {
   return endpoints;
 }
 
-async function getFinalBalance(address, endpoints, strategy) {
+async function getFinalBalance(address, endpoints, strategy, epStats) {
   let lastErr;
   for (const endpoint of orderEndpoints(endpoints, strategy)) {
+    const slot = epStats[endpoint.type] ?? (epStats[endpoint.type] = { ok: 0, err: 0 });
     try {
       const res = await fetch(buildEndpointUrl(endpoint, address));
       if (!res.ok) {
         throw new Error(`${endpoint.type} responded ${res.status}`);
       }
       const parser = ENDPOINT_PARSERS[endpoint.type];
-      return await parser(res, address);
+      const value = await parser(res, address);
+      slot.ok += 1;
+      return value;
     } catch (err) {
+      slot.err += 1;
       lastErr = err;
     }
   }
@@ -140,6 +144,18 @@ async function runWorker() {
   const cfg = workerData.config;
   const id = workerData.id;
   const enabled = cfg.addressTypes;
+  const epStats = {};
+  const flushEp = () => {
+    const snap = {};
+    for (const k of Object.keys(epStats)) {
+      snap[k] = { ok: epStats[k].ok, err: epStats[k].err };
+      epStats[k].ok = 0;
+      epStats[k].err = 0;
+    }
+    if (Object.keys(snap).length) {
+      parentPort.postMessage({ type: "endpointStats", workerId: id, snap });
+    }
+  };
 
   while (true) {
     try {
@@ -157,13 +173,15 @@ async function runWorker() {
       if (multi)                tasks.push(["multi",        multi.address]);
 
       const results = await Promise.all(
-        tasks.map(([, addr]) => getFinalBalance(addr, cfg.endpoints, cfg.endpointStrategy)),
+        tasks.map(([, addr]) => getFinalBalance(addr, cfg.endpoints, cfg.endpointStrategy, epStats)),
       );
       tasks.forEach(([key], i) => { balances[key] = results[i]; });
 
       parentPort.postMessage({ type: "result", workerId: id, kp, multi, balances });
+      flushEp();
     } catch (err) {
       parentPort.postMessage({ type: "error", workerId: id, message: err.message });
+      flushEp();
       await sleep(cfg.errorBackoffMs);
     }
     const jitter = cfg.jitterMs ?? 0;
@@ -344,7 +362,15 @@ async function runMain() {
     hits: 0,
     lastSnapshotCount: 0,
     lastSnapshotAt: Date.now(),
+    endpoints: {},
   };
+  function bumpEndpoint(snap) {
+    for (const [name, val] of Object.entries(snap)) {
+      const slot = stats.endpoints[name] ?? (stats.endpoints[name] = { ok: 0, err: 0 });
+      slot.ok += val.ok;
+      slot.err += val.err;
+    }
+  }
   const startedAt = Date.now();
 
   function snapshotPersisted() {
@@ -370,6 +396,12 @@ async function runMain() {
       const windowRate = windowMin > 0 ? (windowDelta / windowMin).toFixed(1) : "0.0";
       const overallRate = totalElapsedMin > 0 ? (stats.count / totalElapsedMin).toFixed(1) : "0.0";
       const line = "─".repeat(78);
+      const epParts = Object.entries(stats.endpoints).map(([name, s]) => {
+        const total = s.ok + s.err;
+        const errRate = total > 0 ? ((s.err / total) * 100).toFixed(0) : "0";
+        const errCol = s.err === 0 ? C.green : (s.err / Math.max(1, total) > 0.2 ? "\x1b[31m" : C.yellow);
+        return `${C.cyan}${name}${C.reset} ${s.ok}ok/${errCol}${s.err}err${C.reset} (${errRate}%)`;
+      }).join("  ");
       console.log(
         `\n${C.yellow}${line}${C.reset}\n` +
           `${C.bold} STATS${C.reset}  ` +
@@ -377,8 +409,9 @@ async function runMain() {
           `${C.cyan}hits${C.reset} ${stats.hits}  ` +
           `${C.cyan}errors${C.reset} ${stats.errors}  ` +
           `${C.cyan}rate${C.reset} ${windowRate}/min (avg ${overallRate}/min)  ` +
-          `${C.cyan}uptime${C.reset} ${totalElapsedMin.toFixed(1)}min\n` +
-          `${C.yellow}${line}${C.reset}\n`,
+          `${C.cyan}uptime${C.reset} ${totalElapsedMin.toFixed(1)}min` +
+          (epParts ? `\n ENDPOINTS  ${epParts}` : "") +
+          `\n${C.yellow}${line}${C.reset}\n`,
       );
       stats.lastSnapshotCount = stats.count;
       stats.lastSnapshotAt = now;
@@ -424,6 +457,10 @@ async function runMain() {
 
     worker.on("message", async (msg) => {
       if (stopping) return;
+      if (msg.type === "endpointStats") {
+        bumpEndpoint(msg.snap);
+        return;
+      }
       if (msg.type === "error") {
         stats.errors += 1;
         console.log(`\t[worker ${msg.workerId}] error: ${msg.message}`);
