@@ -205,13 +205,28 @@ async function runMain() {
   const workers = [];
   let stopping = false;
 
+  function printFinalStats(reason) {
+    const totalElapsedMin = (Date.now() - startedAt) / 60000;
+    const overallRate = totalElapsedMin > 0 ? (stats.count / totalElapsedMin).toFixed(1) : "0.0";
+    console.log(
+      `\n\t==== FINAL STATS (${reason}) ==== total: ${stats.count} | hits: ${stats.hits} | errors: ${stats.errors} | overall: ${overallRate}/min | uptime: ${totalElapsedMin.toFixed(1)}min\n`,
+    );
+  }
+
   async function stopAll(reason) {
     if (stopping) return;
     stopping = true;
     console.log(`\n\t!!! ${reason} — stopping all workers ...\n`);
     await Promise.all(workers.map((w) => w.terminate().catch(() => {})));
+    printFinalStats(reason);
     console.log("\t All workers stopped. Check the output file for details.");
     process.exit(0);
+  }
+
+  for (const sig of ["SIGINT", "SIGTERM"]) {
+    process.on(sig, () => {
+      stopAll(sig).catch(() => process.exit(1));
+    });
   }
 
   for (let i = 0; i < cfg.workerCount; i++) {
