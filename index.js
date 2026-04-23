@@ -16,6 +16,7 @@ import { appendFileSync, readFileSync, writeFileSync, existsSync, renameSync } f
 import { setTimeout as sleep } from "node:timers/promises";
 import { Worker, isMainThread, parentPort, workerData } from "node:worker_threads";
 import { fileURLToPath } from "node:url";
+import * as readline from "node:readline/promises";
 import * as bitcoin from "bitcoinjs-lib";
 import * as ecc from "tiny-secp256k1";
 import { ECPairFactory } from "ecpair";
@@ -79,6 +80,61 @@ function makeMnemonicSet(opts) {
 function loadConfig() {
   const raw = readFileSync(new URL("./config.json", import.meta.url), "utf8");
   return JSON.parse(raw);
+}
+
+const SECP256K1_N = BigInt(
+  "0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141",
+);
+
+function bigIntToHex64(n) {
+  return n.toString(16).padStart(64, "0");
+}
+
+function keyPairFromBigInt(n) {
+  if (n <= 0n || n >= SECP256K1_N) {
+    throw new Error(`private key out of range: 0x${bigIntToHex64(n)}`);
+  }
+  const buf = Buffer.from(bigIntToHex64(n), "hex");
+  const compressedKey = ECPair.fromPrivateKey(buf, { network: NETWORK, compressed: true });
+  const uncompressedKey = ECPair.fromPrivateKey(buf, { network: NETWORK, compressed: false });
+  const { address: compressedAddress } = bitcoin.payments.p2pkh({
+    pubkey: compressedKey.publicKey, network: NETWORK,
+  });
+  const { address: uncompressedAddress } = bitcoin.payments.p2pkh({
+    pubkey: uncompressedKey.publicKey, network: NETWORK,
+  });
+  const { address: segwitAddress } = bitcoin.payments.p2wpkh({
+    pubkey: compressedKey.publicKey, network: NETWORK,
+  });
+  const { address: nestedSegwitAddress } = bitcoin.payments.p2sh({
+    redeem: bitcoin.payments.p2wpkh({ pubkey: compressedKey.publicKey, network: NETWORK }),
+    network: NETWORK,
+  });
+  return {
+    privateKeyHex: bigIntToHex64(n),
+    wifCompressed: compressedKey.toWIF(),
+    wifUncompressed: uncompressedKey.toWIF(),
+    compressedAddress,
+    uncompressedAddress,
+    segwitAddress,
+    nestedSegwitAddress,
+  };
+}
+
+function loadRangeCursor(file, fallback) {
+  try {
+    if (!existsSync(file)) return fallback;
+    const txt = readFileSync(file, "utf8").trim();
+    if (/^[0-9a-fA-F]{1,64}$/.test(txt)) {
+      const n = BigInt("0x" + txt);
+      if (n > 0n && n < SECP256K1_N) return n;
+    }
+  } catch { /* ignore */ }
+  return fallback;
+}
+
+function saveRangeCursor(file, n) {
+  try { writeFileSync(file, bigIntToHex64(n) + "\n"); } catch { /* ignore */ }
 }
 
 /* ----------------------------- Bitcoin helpers ---------------------------- */
@@ -282,13 +338,22 @@ async function runWorker() {
   // currentDelay starts from config but can be retuned at runtime via
   // {type:"setDelay"} messages from the parent (auto-throttle).
   let currentDelay = cfg.perAddressDelayMs;
+  let rangeResolver = null;
   parentPort.on("message", (m) => {
     if (m?.type === "pause") paused = true;
     else if (m?.type === "resume") paused = false;
     else if (m?.type === "setDelay" && Number.isFinite(m.value)) {
       currentDelay = Math.max(0, m.value);
+    } else if (m?.type === "rangeChunk" && rangeResolver) {
+      const r = rangeResolver; rangeResolver = null; r(m);
     }
   });
+  function requestRangeChunk(count) {
+    return new Promise((resolve) => {
+      rangeResolver = resolve;
+      parentPort.postMessage({ type: "requestRange", workerId: id, count });
+    });
+  }
   const flushEp = () => {
     const snap = {};
     for (const k of Object.keys(epStats)) {
@@ -313,11 +378,12 @@ async function runWorker() {
   // cooldown expires. State is local to the worker — the rate limit is
   // server-side anyway, so each worker discovers it independently.
   const cooldownUntil = {};
-  const batchKeypairs = Math.max(1, cfg.batchKeypairs ?? 1);
+  const batchKeypairs = Math.max(0, cfg.batchKeypairs ?? 1);
   const batchChunkSize = Math.max(1, cfg.batchChunkSize ?? 50);
   const bip39Cfg = cfg.bip39 ?? {};
-  const bip39Enabled = enabled.bip39 === true;
+  const bip39Enabled = enabled.bip39 === true && cfg.mode !== "range";
   const bip39PerBatch = Math.max(0, bip39Cfg.mnemonicsPerBatch ?? 1);
+  const rangeMode = cfg.mode === "range";
 
   // Tiny LRU cache: address -> balance. Catches the (vanishingly rare) case
   // of duplicate addresses without an extra HTTP round-trip.
@@ -347,24 +413,50 @@ async function runWorker() {
       // derived addresses across BIP44/49/84 paths.
       const items = [];
       const allAddrs = [];
-      for (let i = 0; i < batchKeypairs; i++) {
-        const kp = makeKeyPair();
-        const multi = enabled.multisig ? makeMultisigAddress() : null;
-        const tasks = [];
-        if (enabled.uncompressed) tasks.push(["uncompressed", kp.uncompressedAddress]);
-        if (enabled.compressed)   tasks.push(["compressed",   kp.compressedAddress]);
-        if (enabled.segwit)       tasks.push(["segwit",       kp.segwitAddress]);
-        if (enabled.nestedSegwit) tasks.push(["nestedSegwit", kp.nestedSegwitAddress]);
-        if (multi)                tasks.push(["multi",        multi.address]);
-        items.push({ kind: "kp", kp, multi, tasks });
-        for (const [, a] of tasks) allAddrs.push(a);
-      }
-      if (bip39Enabled && bip39PerBatch > 0) {
-        for (let i = 0; i < bip39PerBatch; i++) {
-          const set = makeMnemonicSet(bip39Cfg);
-          items.push({ kind: "mn", mnemonic: set.mnemonic, derivations: set.derivations });
-          for (const d of set.derivations) allAddrs.push(d.address);
+      if (rangeMode) {
+        // Pull the next slice of sequential keys from the parent. The parent
+        // owns the cursor and persists it to disk so we can resume later.
+        const chunk = await requestRangeChunk(batchKeypairs);
+        let n = BigInt("0x" + chunk.startHex);
+        for (let i = 0; i < chunk.count; i++) {
+          let kp;
+          try { kp = keyPairFromBigInt(n); }
+          catch { n += 1n; continue; }
+          const tasks = [];
+          if (enabled.uncompressed) tasks.push(["uncompressed", kp.uncompressedAddress]);
+          if (enabled.compressed)   tasks.push(["compressed",   kp.compressedAddress]);
+          if (enabled.segwit)       tasks.push(["segwit",       kp.segwitAddress]);
+          if (enabled.nestedSegwit) tasks.push(["nestedSegwit", kp.nestedSegwitAddress]);
+          items.push({ kind: "kp", kp, multi: null, tasks });
+          for (const [, a] of tasks) allAddrs.push(a);
+          n += 1n;
         }
+      } else {
+        for (let i = 0; i < batchKeypairs; i++) {
+          const kp = makeKeyPair();
+          const multi = enabled.multisig ? makeMultisigAddress() : null;
+          const tasks = [];
+          if (enabled.uncompressed) tasks.push(["uncompressed", kp.uncompressedAddress]);
+          if (enabled.compressed)   tasks.push(["compressed",   kp.compressedAddress]);
+          if (enabled.segwit)       tasks.push(["segwit",       kp.segwitAddress]);
+          if (enabled.nestedSegwit) tasks.push(["nestedSegwit", kp.nestedSegwitAddress]);
+          if (multi)                tasks.push(["multi",        multi.address]);
+          items.push({ kind: "kp", kp, multi, tasks });
+          for (const [, a] of tasks) allAddrs.push(a);
+        }
+        if (bip39Enabled && bip39PerBatch > 0) {
+          for (let i = 0; i < bip39PerBatch; i++) {
+            const set = makeMnemonicSet(bip39Cfg);
+            items.push({ kind: "mn", mnemonic: set.mnemonic, derivations: set.derivations });
+            for (const d of set.derivations) allAddrs.push(d.address);
+          }
+        }
+      }
+      if (items.length === 0) {
+        // Nothing to do this round (e.g. mnemonic mode with batchKeypairs=0
+        // and bip39 disabled); fall through to the per-iteration delay.
+        await sleep(currentDelay);
+        continue;
       }
 
       const cachedHits = {};
@@ -603,13 +695,38 @@ function normalizeAddressTypes(cfg) {
   return def;
 }
 
+async function promptMode(cfg) {
+  const map = {
+    "1": "privkey", "privkey": "privkey", "p": "privkey",
+    "2": "mnemonic", "mnemonic": "mnemonic", "m": "mnemonic",
+    "3": "range", "range": "range", "r": "range",
+  };
+  const fromEnv = (process.env.MODE || "").toLowerCase().trim();
+  if (map[fromEnv]) return map[fromEnv];
+  if (cfg.mode && map[String(cfg.mode).toLowerCase()]) return map[String(cfg.mode).toLowerCase()];
+  if (!process.stdin.isTTY) {
+    // Non-interactive (no terminal attached) — default to privkey.
+    return "privkey";
+  }
+  console.log("");
+  console.log(`${C.yellow}Select scan mode:${C.reset}`);
+  console.log("  1) Random PrivateKey   (fast brute-force)");
+  console.log("  2) Random BIP39 Mnemonic   (12-word, derives BIP44/49/84)");
+  console.log(`  3) Sequential Range   (resumes from ${C.cyan}${cfg.rangeFile ?? "Last_Scan.txt"}${C.reset})`);
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  let choice;
+  try { choice = (await rl.question("Choice [1/2/3] (default 1): ")).trim().toLowerCase(); }
+  finally { rl.close(); }
+  return map[choice] || "privkey";
+}
+
 async function runMain() {
   const cfg = applyEnvOverrides(loadConfig());
   cfg.endpoints = normalizeEndpoints(cfg);
   cfg.addressTypes = normalizeAddressTypes(cfg);
   cfg.requestTimeoutMs = cfg.requestTimeoutMs ?? 10000;
   cfg.backupIntervalMs = cfg.backupIntervalMs ?? 3600000;
-  cfg.batchKeypairs = Math.max(1, cfg.batchKeypairs ?? 1);
+  cfg.batchKeypairs = Math.max(0, cfg.batchKeypairs ?? 1);
   cfg.batchChunkSize = Math.max(1, cfg.batchChunkSize ?? 50);
   cfg.rateLimitCooldownMs = cfg.rateLimitCooldownMs ?? 60000;
   cfg.bip39 = {
@@ -618,6 +735,33 @@ async function runMain() {
     addressesPerPath: Math.max(1, cfg.bip39?.addressesPerPath ?? 5),
     mnemonicsPerBatch: Math.max(0, cfg.bip39?.mnemonicsPerBatch ?? 1),
   };
+  cfg.rangeFile = cfg.rangeFile ?? "Last_Scan.txt";
+  cfg.range = {
+    start: cfg.range?.start ?? "0000000000000000000000000000000000000000000000000000000000000001",
+  };
+
+  // Interactive mode selection. ENV `MODE=privkey|mnemonic|range` skips the
+  // prompt (handy for headless runs); otherwise we ask once on startup.
+  const mode = await promptMode(cfg);
+  cfg.mode = mode;
+  if (mode === "privkey") {
+    cfg.addressTypes.bip39 = false;
+    if (cfg.batchKeypairs < 1) cfg.batchKeypairs = 1;
+  } else if (mode === "mnemonic") {
+    cfg.addressTypes.bip39 = true;
+    cfg.batchKeypairs = 0;
+    if (cfg.bip39.mnemonicsPerBatch < 1) cfg.bip39.mnemonicsPerBatch = 1;
+  } else if (mode === "range") {
+    cfg.addressTypes.bip39 = false;
+    cfg.addressTypes.multisig = false;
+    if (cfg.batchKeypairs < 1) cfg.batchKeypairs = 20;
+  }
+
+  // Range cursor: BigInt that names the next private key to scan. Loaded from
+  // Last_Scan.txt if it exists so a previous run can be resumed exactly.
+  let rangeCursor = mode === "range"
+    ? loadRangeCursor(cfg.rangeFile, BigInt("0x" + cfg.range.start))
+    : null;
 
   // Auto-throttle config (resolved here so it can be shown in the banner).
   const autoTune = cfg.autoTune ?? {};
@@ -667,6 +811,13 @@ async function runMain() {
   console.log(row("BIP39 mnemonic",  cfg.addressTypes.bip39
     ? `${C.green}ON${C.reset} ${cfg.bip39.mnemonicsPerBatch}/batch × ${cfg.bip39.paths.length} paths × ${cfg.bip39.addressesPerPath} addr (${cfg.bip39.strength === 256 ? 24 : 12} words)`
     : `${C.dim}off${C.reset}`));
+  const modeLabel = mode === "privkey" ? "Random PrivateKey"
+    : mode === "mnemonic" ? "Random BIP39 Mnemonic"
+    : `Sequential Range`;
+  console.log(row("Scan mode",       `${C.green}${modeLabel}${C.reset}`));
+  if (mode === "range") {
+    console.log(row("Range cursor",  `${C.cyan}0x${bigIntToHex64(rangeCursor)}${C.reset}  →  ${C.dim}${cfg.rangeFile}${C.reset}`));
+  }
   console.log(row("Run",             `#${persisted.runs}`));
   console.log(row("Cumulative",
     `total=${persisted.totalCount} hits=${persisted.totalHits} errors=${persisted.totalErrors} uptime=${(persisted.totalUptimeMs / 60000).toFixed(1)}min`));
@@ -867,6 +1018,21 @@ async function runMain() {
 
     worker.on("message", async (msg) => {
       if (stopping) return;
+      if (msg.type === "requestRange") {
+        // Hand out the next chunk of sequential keys and persist the cursor
+        // so the next run picks up where we left off (Last_Scan.txt).
+        if (rangeCursor === null) {
+          worker.postMessage({ type: "rangeChunk", startHex: bigIntToHex64(1n), count: 0 });
+          return;
+        }
+        const startHex = bigIntToHex64(rangeCursor);
+        const count = Math.max(1, Number(msg.count) || 1);
+        rangeCursor = rangeCursor + BigInt(count);
+        if (rangeCursor >= SECP256K1_N) rangeCursor = SECP256K1_N - 1n;
+        saveRangeCursor(cfg.rangeFile, rangeCursor);
+        worker.postMessage({ type: "rangeChunk", startHex, count });
+        return;
+      }
       if (msg.type === "endpointStats") {
         bumpEndpoint(msg.snap);
         return;

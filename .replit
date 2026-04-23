@@ -29,7 +29,7 @@ outputType = "console"
 
 [[workflows.workflow.tasks]]
 task = "shell.exec"
-args = "node index.js"
+args = "MODE=${MODE:-privkey} node index.js"
 
 [agent]
 stack = "BEST_EFFORT_FALLBACK"
