@@ -202,10 +202,24 @@ async function runMain() {
     }, statsIntervalMs).unref();
   }
 
+  const workers = [];
+  let stopping = false;
+
+  async function stopAll(reason) {
+    if (stopping) return;
+    stopping = true;
+    console.log(`\n\t!!! ${reason} — stopping all workers ...\n`);
+    await Promise.all(workers.map((w) => w.terminate().catch(() => {})));
+    console.log("\t All workers stopped. Check the output file for details.");
+    process.exit(0);
+  }
+
   for (let i = 0; i < cfg.workerCount; i++) {
     const worker = new Worker(SELF, { workerData: { config: cfg, id: i + 1 } });
+    workers.push(worker);
 
     worker.on("message", async (msg) => {
+      if (stopping) return;
       if (msg.type === "error") {
         stats.errors += 1;
         console.log(`\t[worker ${msg.workerId}] error: ${msg.message}`);
@@ -214,7 +228,13 @@ async function runMain() {
       stats.count += 1;
       const count = stats.count;
       const hit = handleHit(cfg, msg.kp, msg.multi, msg.balances);
-      if (hit) stats.hits += 1;
+      if (hit) {
+        stats.hits += 1;
+        if (cfg.pauseOnHit) {
+          await stopAll("HIT FOUND");
+          return;
+        }
+      }
       if (!hit && cfg.verbose) {
         printRow(count, msg.workerId, msg.kp, msg.multi, msg.balances);
       }

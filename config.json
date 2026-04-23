@@ -8,5 +8,6 @@
   "outputFile": "Lottery_BTC.txt",
   "checkMultisig": true,
   "verbose": true,
-  "statsIntervalMs": 60000
+  "statsIntervalMs": 60000,
+  "pauseOnHit": true
 }
