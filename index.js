@@ -47,6 +47,14 @@ function makeKeyPair() {
     pubkey: uncompressedKey.publicKey,
     network: NETWORK,
   });
+  const { address: segwitAddress } = bitcoin.payments.p2wpkh({
+    pubkey: compressedKey.publicKey,
+    network: NETWORK,
+  });
+  const { address: nestedSegwitAddress } = bitcoin.payments.p2sh({
+    redeem: bitcoin.payments.p2wpkh({ pubkey: compressedKey.publicKey, network: NETWORK }),
+    network: NETWORK,
+  });
 
   return {
     privateKeyHex: Buffer.from(compressedKey.privateKey).toString("hex"),
@@ -54,6 +62,8 @@ function makeKeyPair() {
     wifUncompressed: uncompressedKey.toWIF(),
     compressedAddress,
     uncompressedAddress,
+    segwitAddress,
+    nestedSegwitAddress,
   };
 }
 
@@ -123,6 +133,8 @@ async function runWorker() {
       const lookups = [
         getFinalBalance(kp.uncompressedAddress, cfg.endpoints),
         getFinalBalance(kp.compressedAddress, cfg.endpoints),
+        getFinalBalance(kp.segwitAddress, cfg.endpoints),
+        getFinalBalance(kp.nestedSegwitAddress, cfg.endpoints),
       ];
       if (multi) lookups.push(getFinalBalance(multi.address, cfg.endpoints));
 
@@ -130,7 +142,9 @@ async function runWorker() {
       const balances = {
         uncompressed: results[0],
         compressed: results[1],
-        multi: multi ? results[2] : 0,
+        segwit: results[2],
+        nestedSegwit: results[3],
+        multi: multi ? results[4] : 0,
       };
 
       parentPort.postMessage({ type: "result", workerId: id, kp, multi, balances });
@@ -144,21 +158,25 @@ async function runWorker() {
 
 /* --------------------------------- Main --------------------------------- */
 
+function pad(s, n) {
+  s = String(s);
+  return s.length >= n ? s : s + " ".repeat(n - s.length);
+}
+
 function printRow(count, workerId, kp, multi, balances) {
-  console.log(
-    "\t-------------------------------------------------------------------------------------------------------",
-  );
-  console.log(
-    `\t#${count} (worker ${workerId})\t Private Key (WIF-Uncompressed) : ${kp.wifUncompressed}`,
-  );
-  console.log(`\t\t Private Key (WIF-Compressed)   : ${kp.wifCompressed}`);
-  console.log(`\t\t Uncompressed Address           : ${kp.uncompressedAddress}  [bal: ${balances.uncompressed}]`);
-  console.log(`\t\t Compressed Address             : ${kp.compressedAddress}  [bal: ${balances.compressed}]`);
-  console.log(`\t\t Private Key (hex)              : ${kp.privateKeyHex}`);
-  if (multi) {
-    console.log(`\t\t Multisig Address               : ${multi.address}  [bal: ${balances.multi}]`);
+  const rows = [
+    { addr: kp.uncompressedAddress, bal: balances.uncompressed, type: "uncompressed" },
+    { addr: kp.compressedAddress, bal: balances.compressed, type: "compressed  " },
+    { addr: kp.segwitAddress, bal: balances.segwit, type: "segwit      " },
+    { addr: kp.nestedSegwitAddress, bal: balances.nestedSegwit, type: "p2sh-segwit " },
+  ];
+  if (multi) rows.push({ addr: multi.address, bal: balances.multi, type: "multisig    " });
+
+  for (const r of rows) {
+    console.log(
+      `Count : ${pad(count, 6)} Addrs : ${pad(r.addr, 44)} Bal : ${r.bal}  [${r.type}|w${workerId}]`,
+    );
   }
-  console.log("\t\t No luck yet!");
 }
 
 function appendHit(file, text) {
@@ -166,37 +184,46 @@ function appendHit(file, text) {
 }
 
 function handleHit(cfg, kp, multi, balances) {
+  const hits = [];
   if (balances.uncompressed > 0) {
-    appendHit(
-      cfg.outputFile,
-      `Uncompressed Private Key\t:  ${kp.wifUncompressed}\n` +
-        ` Uncompressed Bitcoin Address\t:  ${kp.uncompressedAddress}\n` +
-        ` Uncompressed Balance: ${balances.uncompressed}\n\n`,
+    hits.push(
+      `Uncompressed Private Key (WIF)\t: ${kp.wifUncompressed}\n` +
+        ` Uncompressed Address\t: ${kp.uncompressedAddress}\n` +
+        ` Balance: ${balances.uncompressed}\n\n`,
     );
-    console.log("\nYou have just rung the bell of BTC Lottery !!!");
-    return true;
   }
   if (balances.compressed > 0) {
-    appendHit(
-      cfg.outputFile,
-      `Compressed Private Key\t:  ${kp.wifCompressed}\n` +
-        ` Compressed Bitcoin Address\t:  ${kp.compressedAddress}\n` +
-        ` Compressed Balance: ${balances.compressed}\n\n`,
+    hits.push(
+      `Compressed Private Key (WIF)\t: ${kp.wifCompressed}\n` +
+        ` Compressed Address\t: ${kp.compressedAddress}\n` +
+        ` Balance: ${balances.compressed}\n\n`,
     );
-    console.log("\nYou have just rung the bell of BTC Lottery !!!");
-    return true;
+  }
+  if (balances.segwit > 0) {
+    hits.push(
+      `Compressed Private Key (WIF)\t: ${kp.wifCompressed}\n` +
+        ` SegWit (bech32) Address\t: ${kp.segwitAddress}\n` +
+        ` Balance: ${balances.segwit}\n\n`,
+    );
+  }
+  if (balances.nestedSegwit > 0) {
+    hits.push(
+      `Compressed Private Key (WIF)\t: ${kp.wifCompressed}\n` +
+        ` P2SH-SegWit Address\t: ${kp.nestedSegwitAddress}\n` +
+        ` Balance: ${balances.nestedSegwit}\n\n`,
+    );
   }
   if (multi && balances.multi > 0) {
-    appendHit(
-      cfg.outputFile,
-      `Multi BTC Address\t:  ${multi.address}\n` +
-        ` Multisig Private Keys (WIF)\t:  ${multi.privateKeysWif.join(", ")}\n` +
-        ` Multi Balance: ${balances.multi}\n\n`,
+    hits.push(
+      `Multisig Address\t: ${multi.address}\n` +
+        ` Multisig Private Keys (WIF)\t: ${multi.privateKeysWif.join(", ")}\n` +
+        ` Balance: ${balances.multi}\n\n`,
     );
-    console.log("\nYou have just rung the bell of BTC Lottery !!!");
-    return true;
   }
-  return false;
+  if (hits.length === 0) return false;
+  for (const h of hits) appendHit(cfg.outputFile, h);
+  console.log("\n!!! You have just rung the bell of BTC Lottery !!!");
+  return true;
 }
 
 function loadState(file) {
