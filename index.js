@@ -683,6 +683,21 @@ function applyEnvOverrides(cfg) {
   str("STATE_FILE", "stateFile");
   bool("VERBOSE", "verbose");
   bool("PAUSE_ON_HIT", "pauseOnHit");
+  // Range overrides: accept hex with or without 0x prefix, normalise to lower
+  // case so downstream regex / BigInt parsing works uniformly.
+  const hex = (k, target) => {
+    if (env[k] === undefined || env[k] === "") return;
+    const v = env[k].trim().toLowerCase().replace(/^0x/, "");
+    if (!/^[0-9a-f]{1,64}$/.test(v)) {
+      console.error(`Configuration error: ${k} must be 1–64 hex chars (with optional 0x), got "${env[k]}"`);
+      process.exit(1);
+    }
+    cfg.range = cfg.range ?? {};
+    cfg.range[target] = v;
+  };
+  hex("RANGE_START", "start");
+  hex("RANGE_END", "end");
+  str("RANGE_FILE", "rangeFile");
   return cfg;
 }
 
