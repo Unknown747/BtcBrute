@@ -9,5 +9,6 @@
   "checkMultisig": true,
   "verbose": true,
   "statsIntervalMs": 60000,
-  "pauseOnHit": true
+  "pauseOnHit": true,
+  "stateFile": "state.json"
 }

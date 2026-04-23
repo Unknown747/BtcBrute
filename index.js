@@ -12,7 +12,7 @@
  * is effectively zero (~1 in 2^160).
  */
 
-import { appendFileSync, readFileSync } from "node:fs";
+import { appendFileSync, readFileSync, writeFileSync, existsSync } from "node:fs";
 import { setTimeout as sleep } from "node:timers/promises";
 import { Worker, isMainThread, parentPort, workerData } from "node:worker_threads";
 import { fileURLToPath } from "node:url";
@@ -169,10 +169,37 @@ function handleHit(cfg, kp, multi, balances) {
   return false;
 }
 
+function loadState(file) {
+  if (!file || !existsSync(file)) {
+    return { totalCount: 0, totalHits: 0, totalErrors: 0, totalUptimeMs: 0, runs: 0 };
+  }
+  try {
+    return JSON.parse(readFileSync(file, "utf8"));
+  } catch {
+    return { totalCount: 0, totalHits: 0, totalErrors: 0, totalUptimeMs: 0, runs: 0 };
+  }
+}
+
+function saveState(file, state) {
+  if (!file) return;
+  try {
+    writeFileSync(file, JSON.stringify(state, null, 2));
+  } catch (err) {
+    console.log(`\t[state] save failed: ${err.message}`);
+  }
+}
+
 async function runMain() {
   const cfg = loadConfig();
+  const stateFile = cfg.stateFile ?? "state.json";
+  const persisted = loadState(stateFile);
+  persisted.runs = (persisted.runs ?? 0) + 1;
+
   console.log(
     `Starting BTC lottery — workers: ${cfg.workerCount}, delay/addr: ${cfg.perAddressDelayMs}ms, output: ${cfg.outputFile}`,
+  );
+  console.log(
+    `\tCumulative (run #${persisted.runs}): total=${persisted.totalCount} hits=${persisted.totalHits} errors=${persisted.totalErrors} uptime=${(persisted.totalUptimeMs / 60000).toFixed(1)}min`,
   );
 
   const stats = {
@@ -183,6 +210,18 @@ async function runMain() {
     lastSnapshotAt: Date.now(),
   };
   const startedAt = Date.now();
+
+  function snapshotPersisted() {
+    return {
+      totalCount: persisted.totalCount + stats.count,
+      totalHits: persisted.totalHits + stats.hits,
+      totalErrors: persisted.totalErrors + stats.errors,
+      totalUptimeMs: persisted.totalUptimeMs + (Date.now() - startedAt),
+      runs: persisted.runs,
+    };
+  }
+
+  setInterval(() => saveState(stateFile, snapshotPersisted()), 30000).unref();
   const pauseEvery = cfg.addressesPerRound * cfg.workerCount;
   const statsIntervalMs = (cfg.statsIntervalMs ?? 60000);
 
@@ -208,8 +247,10 @@ async function runMain() {
   function printFinalStats(reason) {
     const totalElapsedMin = (Date.now() - startedAt) / 60000;
     const overallRate = totalElapsedMin > 0 ? (stats.count / totalElapsedMin).toFixed(1) : "0.0";
+    const snap = snapshotPersisted();
     console.log(
-      `\n\t==== FINAL STATS (${reason}) ==== total: ${stats.count} | hits: ${stats.hits} | errors: ${stats.errors} | overall: ${overallRate}/min | uptime: ${totalElapsedMin.toFixed(1)}min\n`,
+      `\n\t==== FINAL STATS (${reason}) ==== this run: total=${stats.count} hits=${stats.hits} errors=${stats.errors} | rate=${overallRate}/min | uptime=${totalElapsedMin.toFixed(1)}min\n` +
+        `\t==== CUMULATIVE (${snap.runs} runs) ==== total=${snap.totalCount} hits=${snap.totalHits} errors=${snap.totalErrors} uptime=${(snap.totalUptimeMs / 60000).toFixed(1)}min\n`,
     );
   }
 
@@ -218,8 +259,9 @@ async function runMain() {
     stopping = true;
     console.log(`\n\t!!! ${reason} — stopping all workers ...\n`);
     await Promise.all(workers.map((w) => w.terminate().catch(() => {})));
+    saveState(stateFile, snapshotPersisted());
     printFinalStats(reason);
-    console.log("\t All workers stopped. Check the output file for details.");
+    console.log("\t All workers stopped. State saved. Check the output file for details.");
     process.exit(0);
   }
 
