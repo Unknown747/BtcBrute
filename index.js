@@ -531,6 +531,24 @@ const C = {
   gray: "\x1b[90m",
 };
 
+function formatDuration(minutes) {
+  // Human-readable duration from minutes; degrades gracefully for huge ETAs
+  // (range scans can easily span centuries — show that honestly).
+  if (!Number.isFinite(minutes) || minutes < 0) return "—";
+  if (minutes < 1) return `${Math.max(1, Math.round(minutes * 60))}s`;
+  const m = Math.floor(minutes);
+  if (m < 60) return `${m}m`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h ${m % 60}m`;
+  const d = Math.floor(h / 24);
+  if (d < 365) return `${d}d ${h % 24}h`;
+  const y = d / 365;
+  if (y < 1000) return `${y.toFixed(1)}y`;
+  if (y < 1e6) return `${(y / 1000).toFixed(1)}Ky`;
+  if (y < 1e9) return `${(y / 1e6).toFixed(1)}My`;
+  return `${(y / 1e9).toExponential(1)}Gy`;
+}
+
 function pad(s, n) {
   s = String(s);
   return s.length >= n ? s : s + " ".repeat(n - s.length);
@@ -780,6 +798,9 @@ async function runMain() {
     : null;
   // Optional inclusive upper bound. When the cursor passes it the parent
   // stops handing out work and triggers a clean shutdown.
+  // Snapshot of where this run started (used to compute "scanned this run"
+  // for the progress line). Cursor advances as workers consume keys.
+  const rangeStartAtRun = rangeCursor;
   let rangeEnd = null;
   if (mode === "range" && cfg.range.end) {
     if (!/^[0-9a-fA-F]{1,64}$/.test(cfg.range.end)) {
@@ -869,6 +890,7 @@ async function runMain() {
     lastSnapshotCount: 0,
     lastSnapshotErrors: 0,
     lastSnapshotAt: Date.now(),
+    lastSnapshotCursor: rangeStartAtRun,
     endpoints: {},
     recentErrors: [],   // ring buffer of recent worker error messages
     errorCounts: {},    // tally of error messages for shutdown summary
@@ -967,6 +989,36 @@ async function runMain() {
         const rl = s.rl429 > 0 ? ` ${C.yellow}429×${s.rl429}${C.reset}` : "";
         return `${C.cyan}${name}${C.reset} ${s.ok}ok/${errCol}${s.err}err${C.reset} (${errRate}%, ~${avgMs}ms)${rl}`;
       }).join("  ");
+      // Range progress line: shows position in [start..end], % complete, and
+      // ETA based on the *current window* key consumption rate.
+      let progressLine = "";
+      if (mode === "range" && rangeCursor !== null) {
+        const scannedThisRun = rangeCursor - rangeStartAtRun;
+        const windowKeys = rangeCursor - stats.lastSnapshotCursor;
+        const keysPerMin = windowMin > 0 ? Number(windowKeys) / windowMin : 0;
+        let pctStr = "";
+        let etaStr = "";
+        let totalStr = "";
+        if (rangeEnd !== null) {
+          const total = rangeEnd - BigInt("0x" + (cfg.range.start || "1")) + 1n;
+          const remaining = rangeEnd - rangeCursor + 1n;
+          // Compute percent with one decimal using BigInt math (×1000 trick).
+          const pctTimes10 = total > 0n
+            ? Number((rangeCursor - BigInt("0x" + (cfg.range.start || "1"))) * 1000n / total)
+            : 0;
+          pctStr = ` (${(pctTimes10 / 10).toFixed(1)}%)`;
+          totalStr = ` of ${total.toString()}`;
+          if (keysPerMin > 0 && remaining > 0n) {
+            const minutesLeft = Number(remaining) / keysPerMin;
+            etaStr = `  ${C.cyan}ETA${C.reset} ${formatDuration(minutesLeft)}`;
+          } else if (remaining > 0n) {
+            etaStr = `  ${C.cyan}ETA${C.reset} —`;
+          }
+        }
+        progressLine = `\n RANGE      ${C.cyan}cursor${C.reset} 0x${bigIntToHex64(rangeCursor)}${pctStr}` +
+          `  ${C.cyan}scanned${C.reset} ${scannedThisRun.toString()}${totalStr}` +
+          `  ${C.cyan}rate${C.reset} ${keysPerMin.toFixed(1)} keys/min${etaStr}`;
+      }
       console.log(
         `\n${C.yellow}${line}${C.reset}\n` +
           `${C.bold} STATS${C.reset}  ` +
@@ -975,12 +1027,14 @@ async function runMain() {
           `${C.cyan}errors${C.reset} ${stats.errors}  ` +
           `${C.cyan}rate${C.reset} ${windowRate}/min (avg ${overallRate}/min)  ` +
           `${C.cyan}uptime${C.reset} ${totalElapsedMin.toFixed(1)}min${tuneNote}` +
+          progressLine +
           (epParts ? `\n ENDPOINTS  ${epParts}` : "") +
           `\n${C.yellow}${line}${C.reset}\n`,
       );
       stats.lastSnapshotCount = stats.count;
       stats.lastSnapshotErrors = stats.errors;
       stats.lastSnapshotAt = now;
+      stats.lastSnapshotCursor = rangeCursor;
     }, statsIntervalMs).unref();
   }
 
