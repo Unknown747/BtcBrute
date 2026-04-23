@@ -132,6 +132,18 @@ function orderEndpoints(endpoints, strategy) {
   return endpoints;
 }
 
+// Filter endpoints that are currently in 429 cooldown. If every endpoint is
+// cooling down we still return the full list (least-cooled first) so we keep
+// trying instead of stalling forever.
+function filterCooling(endpoints, cooldownUntil) {
+  const now = Date.now();
+  const live = endpoints.filter((e) => !cooldownUntil[e.type] || cooldownUntil[e.type] <= now);
+  if (live.length > 0) return live;
+  return [...endpoints].sort(
+    (a, b) => (cooldownUntil[a.type] ?? 0) - (cooldownUntil[b.type] ?? 0),
+  );
+}
+
 async function fetchOnce(url, timeoutMs) {
   const res = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) });
   if (!res.ok) {
@@ -149,17 +161,28 @@ async function fetchOnce(url, timeoutMs) {
  * - One automatic retry on transient network/5xx errors before failing over.
  * - Honors HTTP 429 with a longer backoff.
  */
-async function getBalances(addresses, endpoints, strategy, epStats, opts) {
+async function getBalances(addresses, endpoints, strategy, epStats, opts, cooldownUntil, batchChunkSize) {
   const timeoutMs = opts.requestTimeoutMs;
   const errorBackoffMs = opts.errorBackoffMs;
   const rateLimitBackoffMs = opts.rateLimitBackoffMs ?? 5000;
+  const rateLimitCooldownMs = opts.rateLimitCooldownMs ?? 60000;
+  const chunkSize = Math.max(1, batchChunkSize ?? 50);
   let lastErr;
 
-  for (const endpoint of orderEndpoints(endpoints, strategy)) {
+  const ordered = orderEndpoints(filterCooling(endpoints, cooldownUntil), strategy);
+  for (const endpoint of ordered) {
     const slot = epStats[endpoint.type] ?? (epStats[endpoint.type] = { ok: 0, err: 0 });
     const parser = ENDPOINT_PARSERS[endpoint.type];
     const supportsBatch = ENDPOINT_BATCH[endpoint.type];
-    const groups = supportsBatch ? [addresses] : addresses.map((a) => [a]);
+    let groups;
+    if (supportsBatch) {
+      groups = [];
+      for (let i = 0; i < addresses.length; i += chunkSize) {
+        groups.push(addresses.slice(i, i + chunkSize));
+      }
+    } else {
+      groups = addresses.map((a) => [a]);
+    }
 
     try {
       const merged = {};
@@ -169,12 +192,15 @@ async function getBalances(addresses, endpoints, strategy, epStats, opts) {
         try {
           res = await fetchOnce(url, timeoutMs);
         } catch (err) {
-          // 1 retry for transient failures (timeout, network, 5xx). Skip retry on 4xx (except 429).
+          if (err.status === 429) {
+            cooldownUntil[endpoint.type] = Date.now() + rateLimitCooldownMs;
+            throw err; // immediately fail over to next endpoint
+          }
+          // 1 retry for transient failures (timeout, network, 5xx). Skip retry on other 4xx.
           const transient =
-            !err.status || err.status >= 500 || err.status === 429 || err.name === "TimeoutError" || err.name === "AbortError";
+            !err.status || err.status >= 500 || err.name === "TimeoutError" || err.name === "AbortError";
           if (!transient) throw err;
-          const wait = err.status === 429 ? rateLimitBackoffMs : Math.min(errorBackoffMs, 3000);
-          await sleep(wait);
+          await sleep(Math.min(errorBackoffMs, 3000));
           res = await fetchOnce(url, timeoutMs);
         }
         const part = await parser(res, group);
@@ -218,7 +244,16 @@ async function runWorker() {
     requestTimeoutMs: cfg.requestTimeoutMs ?? 10000,
     errorBackoffMs: cfg.errorBackoffMs ?? 15000,
     rateLimitBackoffMs: cfg.rateLimitBackoffMs ?? 5000,
+    rateLimitCooldownMs: cfg.rateLimitCooldownMs ?? 60000,
   };
+
+  // Per-endpoint cooldown timestamps (ms epoch). When an endpoint returns 429
+  // we mark it cooling, and getBalances/orderEndpoints will skip it until the
+  // cooldown expires. State is local to the worker — the rate limit is
+  // server-side anyway, so each worker discovers it independently.
+  const cooldownUntil = {};
+  const batchKeypairs = Math.max(1, cfg.batchKeypairs ?? 1);
+  const batchChunkSize = Math.max(1, cfg.batchChunkSize ?? 50);
 
   // Tiny LRU cache: address -> balance. Catches the (vanishingly rare) case
   // of duplicate addresses without an extra HTTP round-trip.
@@ -241,46 +276,65 @@ async function runWorker() {
       while (paused) await sleep(1000);
     }
     try {
-      const kp = makeKeyPair();
-      const multi = enabled.multisig ? makeMultisigAddress() : null;
+      // Generate a batch of keypairs and build the combined task list so we
+      // can resolve all of their balances in one (or few) HTTP request(s).
+      const items = [];
+      const allAddrs = [];
+      for (let i = 0; i < batchKeypairs; i++) {
+        const kp = makeKeyPair();
+        const multi = enabled.multisig ? makeMultisigAddress() : null;
+        const tasks = [];
+        if (enabled.uncompressed) tasks.push(["uncompressed", kp.uncompressedAddress]);
+        if (enabled.compressed)   tasks.push(["compressed",   kp.compressedAddress]);
+        if (enabled.segwit)       tasks.push(["segwit",       kp.segwitAddress]);
+        if (enabled.nestedSegwit) tasks.push(["nestedSegwit", kp.nestedSegwitAddress]);
+        if (multi)                tasks.push(["multi",        multi.address]);
+        items.push({ kp, multi, tasks });
+        for (const [, a] of tasks) allAddrs.push(a);
+      }
 
-      const tasks = [];
-      const balances = {
-        uncompressed: 0, compressed: 0, segwit: 0, nestedSegwit: 0, multi: 0,
-      };
-      if (enabled.uncompressed) tasks.push(["uncompressed", kp.uncompressedAddress]);
-      if (enabled.compressed)   tasks.push(["compressed",   kp.compressedAddress]);
-      if (enabled.segwit)       tasks.push(["segwit",       kp.segwitAddress]);
-      if (enabled.nestedSegwit) tasks.push(["nestedSegwit", kp.nestedSegwitAddress]);
-      if (multi)                tasks.push(["multi",        multi.address]);
-
-      const allAddrs = tasks.map(([, addr]) => addr);
       const cachedHits = {};
       const toFetch = [];
+      const seen = new Set();
       for (const a of allAddrs) {
         const c = cacheGet(a);
-        if (c !== undefined) cachedHits[a] = c;
-        else toFetch.push(a);
+        if (c !== undefined) {
+          cachedHits[a] = c;
+        } else if (!seen.has(a)) {
+          seen.add(a);
+          toFetch.push(a);
+        }
       }
       let balMap = { ...cachedHits };
       if (toFetch.length > 0) {
-        const fetched = await getBalances(toFetch, cfg.endpoints, cfg.endpointStrategy, epStats, opts);
+        const fetched = await getBalances(
+          toFetch, cfg.endpoints, cfg.endpointStrategy, epStats, opts,
+          cooldownUntil, batchChunkSize,
+        );
         for (const a of toFetch) cacheSet(a, Number(fetched[a] ?? 0));
         balMap = { ...balMap, ...fetched };
       }
-      tasks.forEach(([key, addr]) => { balances[key] = Number(balMap[addr] ?? 0); });
 
-      parentPort.postMessage({ type: "result", workerId: id, kp, multi, balances });
+      for (const { kp, multi, tasks } of items) {
+        const balances = {
+          uncompressed: 0, compressed: 0, segwit: 0, nestedSegwit: 0, multi: 0,
+        };
+        tasks.forEach(([key, addr]) => { balances[key] = Number(balMap[addr] ?? 0); });
+        parentPort.postMessage({ type: "result", workerId: id, kp, multi, balances });
+      }
       flushEp();
     } catch (err) {
       parentPort.postMessage({ type: "error", workerId: id, message: err.message });
       flushEp();
       await sleep(cfg.errorBackoffMs);
     }
+    // perAddressDelayMs is per *keypair*; scale by batch size so request
+    // pacing stays roughly the same regardless of batch size.
     const jitter = cfg.jitterMs ?? 0;
+    const base = cfg.perAddressDelayMs * batchKeypairs;
     const wait = jitter > 0
-      ? cfg.perAddressDelayMs + Math.floor((Math.random() * 2 - 1) * jitter)
-      : cfg.perAddressDelayMs;
+      ? base + Math.floor((Math.random() * 2 - 1) * jitter)
+      : base;
     await sleep(Math.max(0, wait));
   }
 }
@@ -408,6 +462,9 @@ function applyEnvOverrides(cfg) {
   num("REST_PAUSE_MINUTES", "restPauseMinutes");
   num("STATS_INTERVAL_MS", "statsIntervalMs");
   num("BACKUP_INTERVAL_MS", "backupIntervalMs");
+  num("BATCH_KEYPAIRS", "batchKeypairs");
+  num("BATCH_CHUNK_SIZE", "batchChunkSize");
+  num("RATE_LIMIT_COOLDOWN_MS", "rateLimitCooldownMs");
   str("ENDPOINT_STRATEGY", "endpointStrategy");
   str("OUTPUT_FILE", "outputFile");
   str("STATE_FILE", "stateFile");
@@ -431,6 +488,9 @@ async function runMain() {
   cfg.addressTypes = normalizeAddressTypes(cfg);
   cfg.requestTimeoutMs = cfg.requestTimeoutMs ?? 10000;
   cfg.backupIntervalMs = cfg.backupIntervalMs ?? 3600000;
+  cfg.batchKeypairs = Math.max(1, cfg.batchKeypairs ?? 1);
+  cfg.batchChunkSize = Math.max(1, cfg.batchChunkSize ?? 50);
+  cfg.rateLimitCooldownMs = cfg.rateLimitCooldownMs ?? 60000;
   if (!Object.values(cfg.addressTypes).some(Boolean)) {
     console.error("Configuration error: at least one address type must be enabled in config.json -> addressTypes.");
     process.exit(1);
@@ -462,6 +522,8 @@ async function runMain() {
   console.log(row("State file",      stateFile));
   console.log(row("Endpoints",       cfg.endpoints.map((e) => e.type).join(cfg.endpointStrategy === "round-robin" ? " ⇄ " : cfg.endpointStrategy === "random" ? " ? " : " → ")));
   console.log(row("Endpoint strategy", cfg.endpointStrategy ?? "failover"));
+  console.log(row("Batch keypairs",  `${cfg.batchKeypairs} per request (chunk ≤ ${cfg.batchChunkSize} addrs)`));
+  console.log(row("Rate-limit cool", `${cfg.rateLimitCooldownMs / 1000}s on HTTP 429`));
   console.log(row("Run",             `#${persisted.runs}`));
   console.log(row("Cumulative",
     `total=${persisted.totalCount} hits=${persisted.totalHits} errors=${persisted.totalErrors} uptime=${(persisted.totalUptimeMs / 60000).toFixed(1)}min`));

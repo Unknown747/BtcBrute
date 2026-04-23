@@ -1,12 +1,12 @@
 {
-  "totalCount": 1227,
+  "totalCount": 1606,
   "totalHits": 0,
   "totalErrors": 118,
-  "totalUptimeMs": 2712145,
-  "runs": 15,
+  "totalUptimeMs": 2922223,
+  "runs": 16,
   "endpointStats": {
     "blockchain": {
-      "ok": 265,
+      "ok": 587,
       "err": 31
     },
     "blockstream": {

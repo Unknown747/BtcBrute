@@ -14,6 +14,9 @@
     { "type": "mempool", "url": "https://mempool.space/api/address/" }
   ],
   "endpointStrategy": "failover",
+  "batchKeypairs": 20,
+  "batchChunkSize": 50,
+  "rateLimitCooldownMs": 60000,
   "addressTypes": {
     "uncompressed": false,
     "compressed": true,
