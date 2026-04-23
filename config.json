@@ -7,5 +7,6 @@
   "balanceApiUrl": "https://blockchain.info/balance?active=",
   "outputFile": "Lottery_BTC.txt",
   "checkMultisig": true,
-  "verbose": true
+  "verbose": true,
+  "statsIntervalMs": 60000
 }

@@ -175,20 +175,46 @@ async function runMain() {
     `Starting BTC lottery — workers: ${cfg.workerCount}, delay/addr: ${cfg.perAddressDelayMs}ms, output: ${cfg.outputFile}`,
   );
 
-  let count = 0;
+  const stats = {
+    count: 0,
+    errors: 0,
+    hits: 0,
+    lastSnapshotCount: 0,
+    lastSnapshotAt: Date.now(),
+  };
   const startedAt = Date.now();
   const pauseEvery = cfg.addressesPerRound * cfg.workerCount;
+  const statsIntervalMs = (cfg.statsIntervalMs ?? 60000);
+
+  if (statsIntervalMs > 0) {
+    setInterval(() => {
+      const now = Date.now();
+      const totalElapsedMin = (now - startedAt) / 60000;
+      const windowMin = (now - stats.lastSnapshotAt) / 60000;
+      const windowDelta = stats.count - stats.lastSnapshotCount;
+      const windowRate = windowMin > 0 ? (windowDelta / windowMin).toFixed(1) : "0.0";
+      const overallRate = totalElapsedMin > 0 ? (stats.count / totalElapsedMin).toFixed(1) : "0.0";
+      console.log(
+        `\n\t==== STATS ==== total: ${stats.count} | hits: ${stats.hits} | errors: ${stats.errors} | last ${windowMin.toFixed(1)}min: ${windowRate}/min | overall: ${overallRate}/min | uptime: ${totalElapsedMin.toFixed(1)}min\n`,
+      );
+      stats.lastSnapshotCount = stats.count;
+      stats.lastSnapshotAt = now;
+    }, statsIntervalMs).unref();
+  }
 
   for (let i = 0; i < cfg.workerCount; i++) {
     const worker = new Worker(SELF, { workerData: { config: cfg, id: i + 1 } });
 
     worker.on("message", async (msg) => {
       if (msg.type === "error") {
+        stats.errors += 1;
         console.log(`\t[worker ${msg.workerId}] error: ${msg.message}`);
         return;
       }
-      count += 1;
+      stats.count += 1;
+      const count = stats.count;
       const hit = handleHit(cfg, msg.kp, msg.multi, msg.balances);
+      if (hit) stats.hits += 1;
       if (!hit && cfg.verbose) {
         printRow(count, msg.workerId, msg.kp, msg.multi, msg.balances);
       }
