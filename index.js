@@ -158,23 +158,43 @@ async function runWorker() {
 
 /* --------------------------------- Main --------------------------------- */
 
+const C = {
+  reset: "\x1b[0m",
+  dim: "\x1b[2m",
+  bold: "\x1b[1m",
+  cyan: "\x1b[36m",
+  green: "\x1b[32m",
+  yellow: "\x1b[33m",
+  gray: "\x1b[90m",
+};
+
 function pad(s, n) {
   s = String(s);
   return s.length >= n ? s : s + " ".repeat(n - s.length);
 }
 
+function padLeft(s, n) {
+  s = String(s);
+  return s.length >= n ? s : " ".repeat(n - s.length) + s;
+}
+
 function printRow(count, workerId, kp, multi, balances) {
   const rows = [
-    { addr: kp.uncompressedAddress, bal: balances.uncompressed, type: "uncompressed" },
-    { addr: kp.compressedAddress, bal: balances.compressed, type: "compressed  " },
-    { addr: kp.segwitAddress, bal: balances.segwit, type: "segwit      " },
-    { addr: kp.nestedSegwitAddress, bal: balances.nestedSegwit, type: "p2sh-segwit " },
+    { type: "uncompressed", addr: kp.uncompressedAddress, bal: balances.uncompressed },
+    { type: "compressed",   addr: kp.compressedAddress,   bal: balances.compressed   },
+    { type: "segwit",       addr: kp.segwitAddress,       bal: balances.segwit       },
+    { type: "p2sh-segwit",  addr: kp.nestedSegwitAddress, bal: balances.nestedSegwit },
   ];
-  if (multi) rows.push({ addr: multi.address, bal: balances.multi, type: "multisig    " });
+  if (multi) rows.push({ type: "multisig", addr: multi.address, bal: balances.multi });
 
-  for (const r of rows) {
+  const header = `${C.gray}┌─ ${C.bold}#${padLeft(count, 6)}${C.reset}${C.gray} ─ worker ${workerId} ${"─".repeat(58)}${C.reset}`;
+  console.log(header);
+  for (let i = 0; i < rows.length; i++) {
+    const r = rows[i];
+    const branch = i === rows.length - 1 ? "└" : "├";
+    const balColor = r.bal > 0 ? C.green + C.bold : C.dim;
     console.log(
-      `Count : ${pad(count, 6)} Addrs : ${pad(r.addr, 44)} Bal : ${r.bal}  [${r.type}|w${workerId}]`,
+      `${C.gray}${branch}─${C.reset} ${C.cyan}${pad(r.type, 12)}${C.reset} ${pad(r.addr, 44)} ${balColor}${padLeft(r.bal, 10)}${C.reset} sat`,
     );
   }
 }
@@ -264,25 +284,28 @@ async function runMain() {
   const persisted = loadState(stateFile);
   persisted.runs = (persisted.runs ?? 0) + 1;
 
-  const endpointList = cfg.endpoints.map((e, i) => `\t  ${i + 1}. ${e.type} — ${e.url}`).join("\n");
-  console.log("\n" + "=".repeat(80));
-  console.log("\t            BTC LOTTERY — multithreaded address scanner");
-  console.log("=".repeat(80));
-  console.log(`\t Workers           : ${cfg.workerCount}`);
-  console.log(`\t Delay / address   : ${cfg.perAddressDelayMs} ms`);
-  console.log(`\t Round pause       : ${cfg.roundPauseMs} ms (every ${cfg.addressesPerRound * cfg.workerCount} addresses)`);
-  console.log(`\t Stats interval    : ${cfg.statsIntervalMs ?? 60000} ms`);
-  console.log(`\t Multisig check    : ${cfg.checkMultisig ? "ON" : "off"}`);
-  console.log(`\t Pause on hit      : ${cfg.pauseOnHit ? "ON" : "off"}`);
-  console.log(`\t Output file       : ${cfg.outputFile}`);
-  console.log(`\t State file        : ${stateFile}`);
-  console.log(`\t Balance endpoints (failover order):`);
-  console.log(endpointList);
-  console.log(`\t Run               : #${persisted.runs}`);
-  console.log(
-    `\t Cumulative so far : total=${persisted.totalCount} hits=${persisted.totalHits} errors=${persisted.totalErrors} uptime=${(persisted.totalUptimeMs / 60000).toFixed(1)}min`,
-  );
-  console.log("=".repeat(80) + "\n");
+  const dline = "═".repeat(78);
+  const sline = "─".repeat(78);
+  const row = (label, value) =>
+    `${C.gray}│${C.reset} ${C.cyan}${pad(label, 18)}${C.reset} ${value}`;
+  console.log("");
+  console.log(`${C.yellow}${dline}${C.reset}`);
+  console.log(`${C.bold}            BTC LOTTERY — multithreaded address scanner${C.reset}`);
+  console.log(`${C.yellow}${dline}${C.reset}`);
+  console.log(row("Workers",         cfg.workerCount));
+  console.log(row("Delay / address", `${cfg.perAddressDelayMs} ms`));
+  console.log(row("Round pause",     `${cfg.roundPauseMs} ms (every ${cfg.addressesPerRound * cfg.workerCount} addresses)`));
+  console.log(row("Stats interval",  `${cfg.statsIntervalMs ?? 60000} ms`));
+  console.log(row("Multisig check",  cfg.checkMultisig ? `${C.green}ON${C.reset}` : `${C.dim}off${C.reset}`));
+  console.log(row("Pause on hit",    cfg.pauseOnHit ? `${C.green}ON${C.reset}` : `${C.dim}off${C.reset}`));
+  console.log(row("Output file",     cfg.outputFile));
+  console.log(row("State file",      stateFile));
+  console.log(row("Endpoints",       cfg.endpoints.map((e) => e.type).join(" → ")));
+  console.log(row("Run",             `#${persisted.runs}`));
+  console.log(row("Cumulative",
+    `total=${persisted.totalCount} hits=${persisted.totalHits} errors=${persisted.totalErrors} uptime=${(persisted.totalUptimeMs / 60000).toFixed(1)}min`));
+  console.log(`${C.yellow}${dline}${C.reset}`);
+  console.log(`${C.gray}${sline}${C.reset}\n`);
 
   const stats = {
     count: 0,
@@ -315,8 +338,16 @@ async function runMain() {
       const windowDelta = stats.count - stats.lastSnapshotCount;
       const windowRate = windowMin > 0 ? (windowDelta / windowMin).toFixed(1) : "0.0";
       const overallRate = totalElapsedMin > 0 ? (stats.count / totalElapsedMin).toFixed(1) : "0.0";
+      const line = "─".repeat(78);
       console.log(
-        `\n\t==== STATS ==== total: ${stats.count} | hits: ${stats.hits} | errors: ${stats.errors} | last ${windowMin.toFixed(1)}min: ${windowRate}/min | overall: ${overallRate}/min | uptime: ${totalElapsedMin.toFixed(1)}min\n`,
+        `\n${C.yellow}${line}${C.reset}\n` +
+          `${C.bold} STATS${C.reset}  ` +
+          `${C.cyan}total${C.reset} ${stats.count}  ` +
+          `${C.cyan}hits${C.reset} ${stats.hits}  ` +
+          `${C.cyan}errors${C.reset} ${stats.errors}  ` +
+          `${C.cyan}rate${C.reset} ${windowRate}/min (avg ${overallRate}/min)  ` +
+          `${C.cyan}uptime${C.reset} ${totalElapsedMin.toFixed(1)}min\n` +
+          `${C.yellow}${line}${C.reset}\n`,
       );
       stats.lastSnapshotCount = stats.count;
       stats.lastSnapshotAt = now;
