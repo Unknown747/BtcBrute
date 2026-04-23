@@ -10,6 +10,7 @@
     { "type": "blockstream", "url": "https://blockstream.info/api/address/" },
     { "type": "mempool", "url": "https://mempool.space/api/address/" }
   ],
+  "endpointStrategy": "round-robin",
   "addressTypes": {
     "uncompressed": false,
     "compressed": true,

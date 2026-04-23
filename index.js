@@ -104,9 +104,22 @@ function buildEndpointUrl(endpoint, address) {
   throw new Error(`Unknown endpoint type: ${endpoint.type}`);
 }
 
-async function getFinalBalance(address, endpoints) {
+let rrCursor = 0;
+function orderEndpoints(endpoints, strategy) {
+  if (strategy === "round-robin" && endpoints.length > 1) {
+    const start = rrCursor++ % endpoints.length;
+    return endpoints.slice(start).concat(endpoints.slice(0, start));
+  }
+  if (strategy === "random" && endpoints.length > 1) {
+    const start = Math.floor(Math.random() * endpoints.length);
+    return endpoints.slice(start).concat(endpoints.slice(0, start));
+  }
+  return endpoints;
+}
+
+async function getFinalBalance(address, endpoints, strategy) {
   let lastErr;
-  for (const endpoint of endpoints) {
+  for (const endpoint of orderEndpoints(endpoints, strategy)) {
     try {
       const res = await fetch(buildEndpointUrl(endpoint, address));
       if (!res.ok) {
@@ -144,7 +157,7 @@ async function runWorker() {
       if (multi)                tasks.push(["multi",        multi.address]);
 
       const results = await Promise.all(
-        tasks.map(([, addr]) => getFinalBalance(addr, cfg.endpoints)),
+        tasks.map(([, addr]) => getFinalBalance(addr, cfg.endpoints, cfg.endpointStrategy)),
       );
       tasks.forEach(([key], i) => { balances[key] = results[i]; });
 
@@ -317,7 +330,8 @@ async function runMain() {
   console.log(row("Pause on hit",    cfg.pauseOnHit ? `${C.green}ON${C.reset}` : `${C.dim}off${C.reset}`));
   console.log(row("Output file",     cfg.outputFile));
   console.log(row("State file",      stateFile));
-  console.log(row("Endpoints",       cfg.endpoints.map((e) => e.type).join(" → ")));
+  console.log(row("Endpoints",       cfg.endpoints.map((e) => e.type).join(cfg.endpointStrategy === "round-robin" ? " ⇄ " : cfg.endpointStrategy === "random" ? " ? " : " → ")));
+  console.log(row("Endpoint strategy", cfg.endpointStrategy ?? "failover"));
   console.log(row("Run",             `#${persisted.runs}`));
   console.log(row("Cumulative",
     `total=${persisted.totalCount} hits=${persisted.totalHits} errors=${persisted.totalErrors} uptime=${(persisted.totalUptimeMs / 60000).toFixed(1)}min`));
