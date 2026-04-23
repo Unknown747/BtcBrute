@@ -1,9 +1,9 @@
 {
   "workerCount": 6,
-  "addressesPerRound": 30,
-  "perAddressDelayMs": 1500,
-  "jitterMs": 500,
-  "roundPauseMs": 30000,
+  "addressesPerRound": 60,
+  "perAddressDelayMs": 500,
+  "jitterMs": 200,
+  "roundPauseMs": 15000,
   "errorBackoffMs": 15000,
   "requestTimeoutMs": 10000,
   "endpoints": [
@@ -11,7 +11,7 @@
     { "type": "blockstream", "url": "https://blockstream.info/api/address/" },
     { "type": "mempool", "url": "https://mempool.space/api/address/" }
   ],
-  "endpointStrategy": "round-robin",
+  "endpointStrategy": "failover",
   "addressTypes": {
     "uncompressed": false,
     "compressed": true,
