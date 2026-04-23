@@ -151,7 +151,11 @@ async function runWorker() {
       parentPort.postMessage({ type: "error", workerId: id, message: err.message });
       await sleep(cfg.errorBackoffMs);
     }
-    await sleep(cfg.perAddressDelayMs);
+    const jitter = cfg.jitterMs ?? 0;
+    const wait = jitter > 0
+      ? cfg.perAddressDelayMs + Math.floor((Math.random() * 2 - 1) * jitter)
+      : cfg.perAddressDelayMs;
+    await sleep(Math.max(0, wait));
   }
 }
 
@@ -302,7 +306,7 @@ async function runMain() {
   console.log(`${C.bold}            BTC LOTTERY — multithreaded address scanner${C.reset}`);
   console.log(`${C.yellow}${dline}${C.reset}`);
   console.log(row("Workers",         cfg.workerCount));
-  console.log(row("Delay / address", `${cfg.perAddressDelayMs} ms`));
+  console.log(row("Delay / address", `${cfg.perAddressDelayMs} ms${(cfg.jitterMs ?? 0) > 0 ? ` ± ${cfg.jitterMs} ms jitter` : ""}`));
   console.log(row("Round pause",     `${cfg.roundPauseMs} ms (every ${cfg.addressesPerRound * cfg.workerCount} addresses)`));
   console.log(row("Stats interval",  `${cfg.statsIntervalMs ?? 60000} ms`));
   const enabledTypes = Object.entries(cfg.addressTypes)
@@ -395,7 +399,10 @@ async function runMain() {
     });
   }
 
+  const stagger = Math.floor(cfg.perAddressDelayMs / Math.max(1, cfg.workerCount));
   for (let i = 0; i < cfg.workerCount; i++) {
+    if (i > 0) await sleep(stagger);
+    if (stopping) break;
     const worker = new Worker(SELF, { workerData: { config: cfg, id: i + 1 } });
     workers.push(worker);
 

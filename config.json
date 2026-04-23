@@ -1,8 +1,9 @@
 {
-  "workerCount": 4,
-  "addressesPerRound": 20,
-  "perAddressDelayMs": 3000,
-  "roundPauseMs": 60000,
+  "workerCount": 6,
+  "addressesPerRound": 30,
+  "perAddressDelayMs": 1500,
+  "jitterMs": 500,
+  "roundPauseMs": 30000,
   "errorBackoffMs": 15000,
   "endpoints": [
     { "type": "blockchain", "url": "https://blockchain.info/balance?active=" },
