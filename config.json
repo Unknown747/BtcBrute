@@ -4,7 +4,10 @@
   "perAddressDelayMs": 3000,
   "roundPauseMs": 60000,
   "errorBackoffMs": 15000,
-  "balanceApiUrl": "https://blockchain.info/balance?active=",
+  "endpoints": [
+    { "type": "blockchain", "url": "https://blockchain.info/balance?active=" },
+    { "type": "blockstream", "url": "https://blockstream.info/api/address/" }
+  ],
   "outputFile": "Lottery_BTC.txt",
   "checkMultisig": true,
   "verbose": true,

@@ -70,13 +70,43 @@ function makeMultisigAddress() {
   return { address, privateKeysWif: keys.map((k) => k.toWIF()) };
 }
 
-async function getFinalBalance(address, apiUrl) {
-  const res = await fetch(`${apiUrl}${address}`);
-  if (!res.ok) {
-    throw new Error(`API responded ${res.status} for ${address}`);
+const ENDPOINT_PARSERS = {
+  blockchain: async (res, address) => {
+    const data = await res.json();
+    return Number(data[address].final_balance);
+  },
+  blockstream: async (res) => {
+    const data = await res.json();
+    const c = data.chain_stats ?? { funded_txo_sum: 0, spent_txo_sum: 0 };
+    const m = data.mempool_stats ?? { funded_txo_sum: 0, spent_txo_sum: 0 };
+    return (
+      (c.funded_txo_sum - c.spent_txo_sum) +
+      (m.funded_txo_sum - m.spent_txo_sum)
+    );
+  },
+};
+
+function buildEndpointUrl(endpoint, address) {
+  if (endpoint.type === "blockchain") return `${endpoint.url}${address}`;
+  if (endpoint.type === "blockstream") return `${endpoint.url}${address}`;
+  throw new Error(`Unknown endpoint type: ${endpoint.type}`);
+}
+
+async function getFinalBalance(address, endpoints) {
+  let lastErr;
+  for (const endpoint of endpoints) {
+    try {
+      const res = await fetch(buildEndpointUrl(endpoint, address));
+      if (!res.ok) {
+        throw new Error(`${endpoint.type} responded ${res.status}`);
+      }
+      const parser = ENDPOINT_PARSERS[endpoint.type];
+      return await parser(res, address);
+    } catch (err) {
+      lastErr = err;
+    }
   }
-  const data = await res.json();
-  return Number(data[address].final_balance);
+  throw new Error(`all endpoints failed for ${address}: ${lastErr?.message}`);
 }
 
 /* -------------------------------- Worker -------------------------------- */
@@ -91,10 +121,10 @@ async function runWorker() {
       const multi = cfg.checkMultisig ? makeMultisigAddress() : null;
 
       const lookups = [
-        getFinalBalance(kp.uncompressedAddress, cfg.balanceApiUrl),
-        getFinalBalance(kp.compressedAddress, cfg.balanceApiUrl),
+        getFinalBalance(kp.uncompressedAddress, cfg.endpoints),
+        getFinalBalance(kp.compressedAddress, cfg.endpoints),
       ];
-      if (multi) lookups.push(getFinalBalance(multi.address, cfg.balanceApiUrl));
+      if (multi) lookups.push(getFinalBalance(multi.address, cfg.endpoints));
 
       const results = await Promise.all(lookups);
       const balances = {
@@ -189,18 +219,43 @@ function saveState(file, state) {
   }
 }
 
+function normalizeEndpoints(cfg) {
+  if (Array.isArray(cfg.endpoints) && cfg.endpoints.length > 0) return cfg.endpoints;
+  if (cfg.balanceApiUrl) {
+    return [{ type: "blockchain", url: cfg.balanceApiUrl }];
+  }
+  return [
+    { type: "blockchain", url: "https://blockchain.info/balance?active=" },
+    { type: "blockstream", url: "https://blockstream.info/api/address/" },
+  ];
+}
+
 async function runMain() {
   const cfg = loadConfig();
+  cfg.endpoints = normalizeEndpoints(cfg);
   const stateFile = cfg.stateFile ?? "state.json";
   const persisted = loadState(stateFile);
   persisted.runs = (persisted.runs ?? 0) + 1;
 
+  const endpointList = cfg.endpoints.map((e, i) => `\t  ${i + 1}. ${e.type} — ${e.url}`).join("\n");
+  console.log("\n" + "=".repeat(80));
+  console.log("\t            BTC LOTTERY — multithreaded address scanner");
+  console.log("=".repeat(80));
+  console.log(`\t Workers           : ${cfg.workerCount}`);
+  console.log(`\t Delay / address   : ${cfg.perAddressDelayMs} ms`);
+  console.log(`\t Round pause       : ${cfg.roundPauseMs} ms (every ${cfg.addressesPerRound * cfg.workerCount} addresses)`);
+  console.log(`\t Stats interval    : ${cfg.statsIntervalMs ?? 60000} ms`);
+  console.log(`\t Multisig check    : ${cfg.checkMultisig ? "ON" : "off"}`);
+  console.log(`\t Pause on hit      : ${cfg.pauseOnHit ? "ON" : "off"}`);
+  console.log(`\t Output file       : ${cfg.outputFile}`);
+  console.log(`\t State file        : ${stateFile}`);
+  console.log(`\t Balance endpoints (failover order):`);
+  console.log(endpointList);
+  console.log(`\t Run               : #${persisted.runs}`);
   console.log(
-    `Starting BTC lottery — workers: ${cfg.workerCount}, delay/addr: ${cfg.perAddressDelayMs}ms, output: ${cfg.outputFile}`,
+    `\t Cumulative so far : total=${persisted.totalCount} hits=${persisted.totalHits} errors=${persisted.totalErrors} uptime=${(persisted.totalUptimeMs / 60000).toFixed(1)}min`,
   );
-  console.log(
-    `\tCumulative (run #${persisted.runs}): total=${persisted.totalCount} hits=${persisted.totalHits} errors=${persisted.totalErrors} uptime=${(persisted.totalUptimeMs / 60000).toFixed(1)}min`,
-  );
+  console.log("=".repeat(80) + "\n");
 
   const stats = {
     count: 0,
